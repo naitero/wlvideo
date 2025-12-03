@@ -71,7 +71,9 @@ static GpuVendor vendor_from_gl_renderer(const char *renderer) {
     return GPU_VENDOR_UNKNOWN;
 }
 
-/* --- Shaders --- */
+/* ================================
+ * Section: Shaders
+ * ================================ */
 
 /* Vertex shader: simple transform with scale/offset */
 static const char *vert_src =
@@ -136,7 +138,9 @@ static const char *frag_external_src =
     "    gl_FragColor = texture2D(u_tex, v_uv);\n"
     "}\n";
 
-/* --- Cache entry --- */
+/* ================================
+ * Section: Cache entry
+ * ================================ */
 
 typedef struct {
     uintptr_t surface_id;
@@ -145,7 +149,9 @@ typedef struct {
     uint64_t last_use;
 } CacheEntry;
 
-/* --- Renderer structure --- */
+/* ================================
+ * Section: Renderer structure
+ * ================================ */
 
 struct Renderer {
     EGLDisplay dpy;
@@ -195,9 +201,9 @@ struct Renderer {
     GpuVendor gpu_vendor;
 };
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Shader compilation
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Shader compilation
+ * ================================ */
 
 static GLuint compile_shader(GLenum type, const char *src) {
     GLuint sh = glCreateShader(type);
@@ -260,9 +266,9 @@ static bool has_egl_extension(EGLDisplay dpy, const char *ext) {
     return false;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Initialization and destruction
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Initialization and destruction
+ * ================================ */
 
 int renderer_init(Renderer **out, struct wl_display *display) {
     Renderer *r = calloc(1, sizeof(Renderer));
@@ -424,9 +430,9 @@ void renderer_log_stats(Renderer *r) {
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Output management
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Output management
+ * ================================ */
 
 int renderer_create_output(Renderer *r, Output *out) {
     out->egl_window = wl_egl_window_create(out->surface, out->width, out->height);
@@ -471,9 +477,9 @@ void renderer_destroy_output(Renderer *r, Output *out) {
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Cache and state management
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Cache and state management
+ * ================================ */
 
 /*
  * Clear the EGLImage cache. Call when:
@@ -536,9 +542,9 @@ void renderer_reset_texture_state(Renderer *r) {
     LOG_DEBUG("Texture state reset");
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Rendering helpers
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Rendering helpers
+ * ================================ */
 
 /* Compute scale transform for aspect ratio */
 static void compute_transform(float *out, int vid_w, int vid_h, int out_w, int out_h, ScaleMode mode) {
@@ -604,9 +610,9 @@ static CacheEntry *cache_get(Renderer *r, uintptr_t surface_id, uint64_t generat
     return e;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * DMA-BUF rendering (zero-copy path)
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: DMA-BUF rendering (zero-copy path)
+ * ================================ */
 
 static bool render_dmabuf(Renderer *r, Output *out, Frame *frame, ScaleMode scale) {
     if (!r->has_dmabuf || !r->prog_ext) return false;
@@ -735,9 +741,9 @@ static bool render_dmabuf(Renderer *r, Output *out, Frame *frame, ScaleMode scal
     return true;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Software rendering
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Software rendering
+ * ================================ */
 
 static void render_software(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, ScaleMode scale) {
     int slot = frame->sw.ring_slot;
@@ -822,9 +828,9 @@ static void render_software(Renderer *r, Output *out, Frame *frame, SoftwareRing
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Main draw function
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Main draw function
+ * ================================ */
 
 bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, ScaleMode scale, bool try_dmabuf) {
     /* Validate EGL surface before attempting to render */

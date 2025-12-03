@@ -183,8 +183,9 @@ typedef struct App {
 
 extern App *g_app;
 
-/* --- Logging ---
- *
+/* ================================
+ * Section: Logging
+ * ================================
  * All log macros include monotonic timestamp for debugging timing issues.
  * Format: [LEVEL T+seconds.milliseconds] message
  */

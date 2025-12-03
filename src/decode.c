@@ -111,7 +111,9 @@ struct Decoder {
     uint64_t dmabuf_exports;
 };
 
-/* --- GPU vendor detection --- */
+/* ================================
+ * Section: GPU vendor detection
+ * ================================ */
 
 static GpuVendor vendor_from_sysfs(const char *render_node) {
     if (!render_node) return GPU_VENDOR_UNKNOWN;
@@ -185,7 +187,9 @@ static bool nvidia_supports_codec(enum AVCodecID id) {
     }
 }
 
-/* --- Video format detection --- */
+/* ================================
+ * Section: Video format detection
+ * ================================ */
 
 static int detect_bit_depth(AVCodecParameters *par) {
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(par->format);
@@ -259,7 +263,9 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
     return fmts[0];
 }
 
-/* --- Hardware acceleration initialization --- */
+/* ================================
+ * Section: Hardware acceleration initialization
+ * ================================ */
 
 #ifdef HAVE_VAAPI
 static int init_vaapi(Decoder *dec, const char *user_device) {
@@ -351,9 +357,9 @@ static int init_cuda(Decoder *dec) {
 }
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Decoder initialization and destruction
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Decoder initialization and destruction
+ * ================================ */
 
 int decoder_init(Decoder **out, const char *path, bool hw_accel, const char *gpu_device) {
     Decoder *dec = calloc(1, sizeof(Decoder));
@@ -567,9 +573,9 @@ void decoder_destroy(Decoder *dec) {
     free(dec);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * DMA-BUF export
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: DMA-BUF export
+ * ================================ */
 
 #ifdef HAVE_VAAPI
 static bool export_vaapi_dmabuf(Decoder *dec, AVFrame *f, Frame *frame) {
@@ -665,9 +671,9 @@ static bool export_vaapi_dmabuf(Decoder *dec, AVFrame *f, Frame *frame) {
 }
 #endif
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Software frame extraction
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Software frame extraction
+ * ================================ */
 
 static bool extract_sw_frame(Decoder *dec, Frame *frame, SoftwareRing *ring) {
     AVFrame *src = dec->frame;
@@ -750,9 +756,9 @@ static bool extract_sw_frame(Decoder *dec, Frame *frame, SoftwareRing *ring) {
     return true;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Frame decoding
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Frame decoding
+ * ================================ */
 
 bool decoder_get_frame(Decoder *dec, Frame *frame, SoftwareRing *ring, bool need_sw) {
     int ret;
@@ -836,9 +842,9 @@ bool decoder_get_frame(Decoder *dec, Frame *frame, SoftwareRing *ring, bool need
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Seek and control
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Seek and control
+ * ================================ */
 
 int decoder_seek_start(Decoder *dec) {
     int ret = av_seek_frame(dec->fmt_ctx, dec->stream_idx, 0, AVSEEK_FLAG_BACKWARD);
@@ -904,9 +910,9 @@ void decoder_increment_generation(Decoder *dec) {
     LOG_DEBUG("Decoder generation incremented to %lu", (unsigned long)dec->surface_generation);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Ring buffer
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Ring buffer
+ * ================================ */
 
 int sw_ring_init(SoftwareRing *ring, int width, int height) {
     ring->width = width;

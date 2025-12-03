@@ -308,7 +308,9 @@ static bool process_output_lifecycle(App *app) {
     return any_recreated;
 }
 
-/* --- Main --- */
+/* ================================
+ * Section: Main
+ * ================================ */
 
 int main(int argc, char **argv) {
     App app = {0};

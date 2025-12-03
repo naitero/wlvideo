@@ -34,7 +34,9 @@ const char *output_state_name(OutputState state) {
     }
 }
 
-/* --- Layer surface events --- */
+/* ================================
+ * Section: Layer surface events
+ * ================================ */
 
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *surf,
                             uint32_t serial, uint32_t w, uint32_t h) {
@@ -130,7 +132,9 @@ static const struct zwlr_layer_surface_v1_listener layer_listener = {
     .closed = layer_closed,
 };
 
-/* --- Frame callback --- */
+/* ================================
+ * Section: Frame callback
+ * ================================ */
 
 static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
     (void)time;
@@ -168,7 +172,9 @@ void wayland_request_frame(Output *out) {
     out->state = OUT_WAITING_CALLBACK;
 }
 
-/* --- Output events --- */
+/* ================================
+ * Section: Output events
+ * ================================ */
 
 static void output_geometry(void *data, struct wl_output *o, int32_t x, int32_t y,
                             int32_t pw, int32_t ph, int32_t subpx, const char *make,
@@ -231,9 +237,9 @@ static const struct wl_output_listener output_listener = {
     .description = output_desc,
 };
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Registry
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Registry
+ * ================================ */
 
 static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
                             const char *iface, uint32_t ver) {
@@ -294,9 +300,9 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_remove,
 };
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Public API
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ================================
+ * Section: Public API
+ * ================================ */
 
 int wayland_init(App *app) {
     app->display = wl_display_connect(NULL);
