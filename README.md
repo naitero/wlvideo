@@ -7,10 +7,7 @@ A high-performance video wallpaper application for wlroots-based Wayland composi
 Requires compositors implementing the `wlr-layer-shell-unstable-v1` protocol:
 
 - **Sway** — Reference wlroots compositor
-- **Hyprland** — Dynamic tiling compositor
-- **river** — Dynamic tiling Wayland compositor
-- **Wayfire** — 3D Wayland compositor
-- **labwc** — Openbox-style stacking compositor
+- And etc.
 
 > **Note:** GNOME (Mutter), Weston, and other non-wlroots compositors are not supported as they do not implement the layer-shell protocol.
 
