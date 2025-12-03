@@ -5,6 +5,8 @@
  * On Intel/AMD, frames can be exported as DMA-BUF for zero-copy rendering.
  * On NVIDIA, DMA-BUF export works but import usually fails due to tiled
  * modifiers, so we fall back to CPU readback.
+ *
+ * Updated for FFmpeg 7.0+ API compatibility (AV_PROFILE_* constants)
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -25,6 +27,19 @@
 #include <libavutil/pixdesc.h>
 #include <libavutil/imgutils.h>
 #include <drm_fourcc.h>
+
+/* FFmpeg 7.0+ moved profiles to defs.h and renamed FF_PROFILE_* to AV_PROFILE_* */
+#include <libavcodec/version.h>
+#if LIBAVCODEC_VERSION_MAJOR >= 61
+#include <libavcodec/defs.h>
+/* Use new AV_PROFILE_* names */
+#define WLVIDEO_PROFILE_HEVC_MAIN_10 AV_PROFILE_HEVC_MAIN_10
+#define WLVIDEO_PROFILE_HEVC_REXT    AV_PROFILE_HEVC_REXT
+#else
+/* Fallback for FFmpeg 6.x and earlier */
+#define WLVIDEO_PROFILE_HEVC_MAIN_10 FF_PROFILE_HEVC_MAIN_10
+#define WLVIDEO_PROFILE_HEVC_REXT    FF_PROFILE_HEVC_REXT
+#endif
 
 #ifdef HAVE_VAAPI
 #include <libavutil/hwcontext_vaapi.h>
@@ -166,8 +181,9 @@ static int detect_bit_depth(AVCodecParameters *par) {
         return par->bits_per_raw_sample;
 
     /* Profile-based heuristics for common codecs */
+    /* Using compatibility macros for FFmpeg 7.0+ */
     if (par->codec_id == AV_CODEC_ID_HEVC &&
-        (par->profile == FF_PROFILE_HEVC_MAIN_10 || par->profile == FF_PROFILE_HEVC_REXT))
+        (par->profile == WLVIDEO_PROFILE_HEVC_MAIN_10 || par->profile == WLVIDEO_PROFILE_HEVC_REXT))
         return 10;
 
     if (par->codec_id == AV_CODEC_ID_VP9 && par->profile >= 2)
@@ -517,6 +533,10 @@ void decoder_destroy(Decoder *dec) {
     av_frame_free(&dec->frame);
     av_frame_free(&dec->sw_frame);
     av_packet_free(&dec->packet);
+    /*
+     * Note: avcodec_free_context() handles both closing and freeing.
+     * avcodec_close() was removed in FFmpeg 7.0+
+     */
     avcodec_free_context(&dec->codec_ctx);
     av_buffer_unref(&dec->hw_ctx);
     avformat_close_input(&dec->fmt_ctx);
