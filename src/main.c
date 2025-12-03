@@ -423,8 +423,23 @@ int main(int argc, char **argv) {
 
     /* Main loop */
     app.running = true;
-    app.use_dmabuf_path = decoder_dmabuf_export_supported(app.decoder);
-    app.render_path_determined = !app.use_dmabuf_path;
+
+    /*
+     * DMA-BUF zero-copy path selection:
+     * - Intel/AMD: DMA-BUF export + import works, use zero-copy
+     * - NVIDIA: DMA-BUF export works, but import fails or produces garbage
+     *           due to tiled modifiers (0x30000000xxxxxxxx). Force software path.
+     */
+    if (decode_vendor == GPU_VENDOR_NVIDIA) {
+        LOG_INFO("NVIDIA detected: forcing software render path (DMA-BUF modifiers incompatible)");
+        app.use_dmabuf_path = false;
+        app.render_path_determined = true;  /* Don't even try DMA-BUF */
+        /* Tell decoder to skip DMA-BUF export entirely — saves CPU/FD overhead */
+        decoder_set_dmabuf_export_result(app.decoder, false);
+    } else {
+        app.use_dmabuf_path = decoder_dmabuf_export_supported(app.decoder);
+        app.render_path_determined = !app.use_dmabuf_path;
+    }
 
     int wl_fd = wl_display_get_fd(app.display);
     struct pollfd pfd = { .fd = wl_fd, .events = POLLIN };
