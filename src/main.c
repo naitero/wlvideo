@@ -10,6 +10,11 @@
  * Surface lifecycle: When the compositor restarts, layer surfaces may be
  * closed. We handle this by destroying old resources and recreating surfaces
  * when outputs become available again.
+ *
+ * Key design decisions:
+ * - Separate "cache clear" from "DMA-BUF compatibility reset"
+ * - Only reset render_path_determined on actual context loss, not surface recreation
+ * - Strict state machine for output lifecycle to prevent duplicate operations
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -27,6 +32,7 @@
 #include "wlvideo.h"
 
 App *g_app = NULL;
+double g_log_start_time = 0;
 static volatile sig_atomic_t quit = 0;
 
 static void handle_signal(int sig) {
@@ -161,11 +167,16 @@ static bool output_matches_filter(Output *out, const Config *cfg) {
     return strcmp(out->name, cfg->output_name) == 0;
 }
 
-/* Tear down and recreate the EGL renderer and per-output EGL surfaces.
- * Keeps Wayland surfaces intact when possible; if EGL surface recreation
- * fails, the Wayland surface is destroyed and marked for full recreation. */
+/*
+ * Reset the EGL renderer after context loss.
+ *
+ * This is a full reset: destroy and recreate EGL context, clear all caches,
+ * and reset DMA-BUF compatibility state. Called when:
+ * - Compositor restarts (layer_closed received)
+ * - EGL_CONTEXT_LOST error
+ */
 static bool reset_renderer(App *app) {
-    LOG_INFO("Resetting renderer (EGL context) after surface loss");
+    LOG_INFO("Resetting renderer (EGL context) after compositor event");
 
     if (app->renderer) {
         Output *out;
@@ -180,99 +191,116 @@ static bool reset_renderer(App *app) {
         return false;
     }
 
-    /* Recreate EGL surfaces for outputs that still have Wayland surfaces */
+    /*
+     * Full reset: clear cache AND reset DMA-BUF compatibility state.
+     * This is the only place where we reset dmabuf_tested/dmabuf_works,
+     * because a new EGL context might have different capabilities.
+     */
+    renderer_clear_cache(app->renderer);
+    renderer_reset_dmabuf_state(app->renderer);
+    renderer_reset_texture_state(app->renderer);
+
+    /* Also increment decoder generation to invalidate any cached surface refs */
+    decoder_increment_generation(app->decoder);
+
+    /* Re-create EGL surfaces for outputs that still have Wayland surfaces */
     Output *out;
     wl_list_for_each(out, &app->outputs, link) {
-        if (!out->surface || out->state == OUT_CLOSED)
+        if (!out->surface)
             continue;
-
-        if (!app->renderer) break;
 
         if (out->state == OUT_READY || out->state == OUT_WAITING_CALLBACK) {
             if (renderer_create_output(app->renderer, out) == 0) {
-                LOG_INFO("EGL surface recreated for %s", out->name);
+                LOG_INFO("Output %s: EGL surface recreated after reset", out->name);
             } else {
-                LOG_WARN("Failed to recreate EGL surface for %s, recreating Wayland surface", out->name);
+                LOG_WARN("Output %s: failed to recreate EGL surface, will recreate Wayland surface",
+                         out->name);
                 wayland_destroy_surface(out);
-                out->needs_surface_create = true;
-                out->surface_ever_created = false;
+                /* State is now OUT_PENDING_RECREATE */
             }
         }
     }
 
-    renderer_clear_cache(app->renderer);
     app->render_path_determined = false;
     app->renderer_needs_reset = false;
     return true;
 }
 
-/* Process deferred surface destruction and recreation.
- * Returns true if any surface was successfully recreated. */
+/*
+ * Process deferred output lifecycle operations.
+ *
+ * This function handles the state machine transitions for outputs:
+ * - OUT_PENDING_DESTROY → destroy Wayland resources → OUT_PENDING_RECREATE
+ * - OUT_PENDING_RECREATE → create new surface → OUT_UNCONFIGURED
+ *
+ * Returns true if any surface was successfully recreated.
+ */
 static bool process_output_lifecycle(App *app) {
     bool any_recreated = false;
     Output *out;
 
     wl_list_for_each(out, &app->outputs, link) {
-        /* Handle deferred destruction from layer_closed */
-        if (out->needs_surface_destroy) {
-            out->needs_surface_destroy = false;
+        /* Handle deferred destruction */
+        if (out->state == OUT_PENDING_DESTROY) {
+            LOG_DEBUG("Output %s: processing deferred destruction", out->name);
 
-            LOG_DEBUG("Destroying surfaces for %s", out->name);
-
-            /* EGL resources already destroyed in layer_closed */
-            /* Destroy Wayland resources via helper */
+            /* EGL resources already destroyed in layer_closed callback */
+            /* Destroy Wayland resources - this transitions to OUT_PENDING_RECREATE */
             wayland_destroy_surface(out);
 
-            /* Mark for recreation */
-            out->needs_surface_create = true;
+            /* State is now OUT_PENDING_RECREATE */
         }
 
         /* Recreate surface if needed and output info is complete */
-        if (out->needs_surface_create &&
+        if (out->state == OUT_PENDING_RECREATE &&
             out->width > 0 && out->height > 0 && out->name[0] &&
             output_matches_filter(out, &app->config)) {
 
-            out->needs_surface_create = false;
-
-            LOG_INFO("Recreating surface for %s", out->name);
+            LOG_INFO("Output %s: recreating surface", out->name);
 
             if (wayland_create_surface(out, app) == 0) {
                 /*
                  * Wait for compositor to send configure event before creating
-                 * EGL surface. Without this, wl_egl_window_create may fail
-                 * because the surface isn't ready yet.
+                 * EGL surface. This is essential - without it, wl_egl_window_create
+                 * may fail or produce incorrect results.
                  */
                 wl_display_roundtrip(app->display);
 
                 if (out->state == OUT_READY) {
-                    if (renderer_create_output(app->renderer, out) == 0) {
-                        LOG_INFO("Surface recreated successfully for %s", out->name);
+                    if (app->renderer && renderer_create_output(app->renderer, out) == 0) {
+                        LOG_INFO("Output %s: surface recreated successfully", out->name);
                         any_recreated = true;
                     } else {
-                        LOG_ERROR("Failed to create EGL surface for %s", out->name);
+                        LOG_ERROR("Output %s: failed to create EGL surface", out->name);
                         wayland_destroy_surface(out);
-                        out->needs_surface_create = true;
-                        out->surface_ever_created = false;
+                        /* Will retry on next iteration */
                     }
                 } else {
-                    LOG_WARN("Surface not configured after roundtrip for %s (state=%d)",
-                             out->name, out->state);
-                    wayland_destroy_surface(out);
+                    LOG_WARN("Output %s: surface not configured after roundtrip (state=%s)",
+                             out->name, output_state_name(out->state));
+                    /* Surface created but not configured yet - this is okay,
+                     * will be configured on next compositor event */
                 }
             } else {
-                LOG_ERROR("Failed to create Wayland surface for %s", out->name);
+                LOG_ERROR("Output %s: failed to create Wayland surface", out->name);
+                /* Will retry on next iteration */
             }
-        } else if (out->surface && (out->state == OUT_READY || out->state == OUT_WAITING_CALLBACK) &&
-                   (!out->egl_surface || out->egl_surface == EGL_NO_SURFACE)) {
-            /* Wayland surface exists but EGL surface was lost (e.g., after renderer reset) */
+        }
+
+        /* Handle case where Wayland surface exists but EGL surface is missing */
+        if (out->surface && app->renderer &&
+            (out->state == OUT_READY || out->state == OUT_WAITING_CALLBACK) &&
+            (!out->egl_surface || out->egl_surface == EGL_NO_SURFACE)) {
+
+            LOG_DEBUG("Output %s: reattaching EGL surface", out->name);
             if (renderer_create_output(app->renderer, out) == 0) {
-                LOG_INFO("EGL surface reattached for %s", out->name);
+                LOG_INFO("Output %s: EGL surface reattached", out->name);
                 any_recreated = true;
             } else {
-                LOG_WARN("Failed to reattach EGL surface for %s, recreating surface", out->name);
+                LOG_WARN("Output %s: failed to reattach EGL surface, will recreate",
+                         out->name);
                 wayland_destroy_surface(out);
-                out->needs_surface_create = true;
-                out->surface_ever_created = false;
+                /* State is now OUT_PENDING_RECREATE, will be handled on next iteration */
             }
         }
     }
@@ -280,9 +308,12 @@ static bool process_output_lifecycle(App *app) {
     return any_recreated;
 }
 
+/* --- Main --- */
+
 int main(int argc, char **argv) {
     App app = {0};
     g_app = &app;
+    g_log_start_time = now();
     wl_list_init(&app.outputs);
 
     if (parse_args(&app.config, argc, argv) < 0)
@@ -355,12 +386,21 @@ int main(int argc, char **argv) {
             continue;
 
         if (wayland_create_surface(out, &app) < 0) {
-            LOG_ERROR("Surface creation failed for %s", out->name);
+            LOG_ERROR("Output %s: surface creation failed", out->name);
+            continue;
+        }
+
+        /* Wait for configure */
+        wl_display_roundtrip(app.display);
+
+        if (out->state != OUT_READY) {
+            LOG_WARN("Output %s: not configured after roundtrip", out->name);
+            wayland_destroy_surface(out);
             continue;
         }
 
         if (renderer_create_output(app.renderer, out) < 0) {
-            LOG_ERROR("EGL surface failed for %s", out->name);
+            LOG_ERROR("Output %s: EGL surface failed", out->name);
             wayland_destroy_surface(out);
             continue;
         }
@@ -388,6 +428,11 @@ int main(int argc, char **argv) {
     struct pollfd pfd = { .fd = wl_fd, .events = POLLIN };
 
     Frame frame = {0};
+    /* Initialize DMA-BUF FDs to invalid */
+    for (int i = 0; i < 4; i++) {
+        frame.hw.dmabuf.fd[i] = -1;
+    }
+
     bool have_frame = false;
     int64_t displayed_frame = -1;
 
@@ -411,16 +456,24 @@ int main(int argc, char **argv) {
         /* Process deferred surface lifecycle operations */
         bool surfaces_recreated = process_output_lifecycle(&app);
 
-        /* After surface recreation, invalidate stale frame data */
+        /*
+         * After surface recreation, invalidate cached frame data.
+         * Note: We only clear the EGL cache here, NOT the DMA-BUF compatibility
+         * state. The driver's ability to import DMA-BUFs doesn't change just
+         * because a surface was recreated.
+         */
         if (surfaces_recreated) {
-            LOG_INFO("Surfaces recreated, resetting render state");
+            LOG_INFO("Surfaces recreated, clearing EGL cache");
             renderer_clear_cache(app.renderer);
             if (have_frame && frame.type == FRAME_HW) {
                 decoder_close_dmabuf(&frame.hw.dmabuf);
             }
             have_frame = false;
-            /* Re-detect render path since surfaces changed */
-            app.render_path_determined = false;
+            /*
+             * Note: Don't reset render_path_determined here!
+             * Surface recreation doesn't change DMA-BUF compatibility.
+             * Only reset it on actual context loss (in reset_renderer).
+             */
         }
 
         /* Prepare Wayland events */
@@ -518,9 +571,10 @@ int main(int argc, char **argv) {
 
                 if (displayed_frame >= target) break;
 
-                /* Skip this frame */
-                if (frame.type == FRAME_HW)
+                /* Skip this frame - MUST close DMA-BUF FDs to prevent leak */
+                if (frame.type == FRAME_HW) {
                     decoder_close_dmabuf(&frame.hw.dmabuf);
+                }
             }
 
             /* If still far behind, reset clock rather than skip forever */
@@ -543,8 +597,12 @@ int main(int argc, char **argv) {
 
                 /* Handle render failure (e.g., invalid EGL surface) */
                 if (!ok && !frame.sw.available) {
-                    LOG_WARN("Render failed for %s, marking for recreation", out->name);
-                    out->needs_surface_destroy = true;
+                    LOG_WARN("Output %s: render failed, marking for recreation", out->name);
+                    /* Trigger destruction via state machine */
+                    if (app.renderer) {
+                        renderer_destroy_output(app.renderer, out);
+                    }
+                    out->state = OUT_PENDING_DESTROY;
                     continue;
                 }
 
@@ -568,14 +626,15 @@ int main(int argc, char **argv) {
     }
 
     /* Cleanup */
-    LOG_INFO("Exiting");
+    LOG_INFO("Exiting after %lu frames", (unsigned long)app.frame_counter);
 
     if (have_frame && frame.type == FRAME_HW)
         decoder_close_dmabuf(&frame.hw.dmabuf);
 
+    /* Log per-output stats and cleanup */
     wl_list_for_each(out, &app.outputs, link) {
         if (out->frames_rendered > 0)
-            LOG_INFO("%s: %lu frames", out->name, (unsigned long)out->frames_rendered);
+            LOG_INFO("Output %s: %lu frames rendered", out->name, (unsigned long)out->frames_rendered);
         renderer_destroy_output(app.renderer, out);
         wayland_destroy_surface(out);
     }

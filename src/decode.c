@@ -7,6 +7,11 @@
  * modifiers, so we fall back to CPU readback.
  *
  * Updated for FFmpeg 7.0+ API compatibility (AV_PROFILE_* constants)
+ *
+ * Key design decisions:
+ * - surface_generation is stable within a playback session, changes only on seek
+ * - This allows EGLImage cache to work effectively (same surface_id + generation = cache hit)
+ * - DMA-BUF FDs are always closed by decoder_close_dmabuf(), caller must ensure it's called
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -92,12 +97,22 @@ struct Decoder {
     bool dmabuf_export_tested;
     bool dmabuf_export_works;
 
+    /*
+     * Surface generation: stable identifier that changes only on seek/loop.
+     * Combined with VA surface ID, this forms a unique key for EGL cache.
+     * The generation is NOT incremented per-frame to allow cache hits.
+     */
     uint64_t surface_generation;
     enum AVCodecID codec_id;
     int bit_depth;
+
+    /* Statistics */
+    uint64_t frames_decoded;
+    uint64_t dmabuf_exports;
 };
 
-/* GPU vendor detection from sysfs */
+/* --- GPU vendor detection --- */
+
 static GpuVendor vendor_from_sysfs(const char *render_node) {
     if (!render_node) return GPU_VENDOR_UNKNOWN;
 
@@ -125,7 +140,6 @@ static GpuVendor vendor_from_sysfs(const char *render_node) {
 }
 
 #ifdef HAVE_VAAPI
-/* GPU vendor detection from VA-API driver string */
 static GpuVendor vendor_from_vaapi(VADisplay dpy) {
     const char *str = vaQueryVendorString(dpy);
     if (!str) return GPU_VENDOR_UNKNOWN;
@@ -171,7 +185,8 @@ static bool nvidia_supports_codec(enum AVCodecID id) {
     }
 }
 
-/* Detect bit depth from stream parameters */
+/* --- Video format detection --- */
+
 static int detect_bit_depth(AVCodecParameters *par) {
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(par->format);
     if (desc && desc->comp[0].depth > 0)
@@ -181,7 +196,6 @@ static int detect_bit_depth(AVCodecParameters *par) {
         return par->bits_per_raw_sample;
 
     /* Profile-based heuristics for common codecs */
-    /* Using compatibility macros for FFmpeg 7.0+ */
     if (par->codec_id == AV_CODEC_ID_HEVC &&
         (par->profile == WLVIDEO_PROFILE_HEVC_MAIN_10 || par->profile == WLVIDEO_PROFILE_HEVC_REXT))
         return 10;
@@ -245,9 +259,9 @@ static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
     return fmts[0];
 }
 
+/* --- Hardware acceleration initialization --- */
+
 #ifdef HAVE_VAAPI
-/* Initialize VA-API on the best available device.
- * Prefers Intel/AMD for zero-copy capability, falls back to NVIDIA. */
 static int init_vaapi(Decoder *dec, const char *user_device) {
     static const char *devices[] = {
         "/dev/dri/renderD128", "/dev/dri/renderD129",
@@ -337,9 +351,16 @@ static int init_cuda(Decoder *dec) {
 }
 #endif
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Decoder initialization and destruction
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 int decoder_init(Decoder **out, const char *path, bool hw_accel, const char *gpu_device) {
     Decoder *dec = calloc(1, sizeof(Decoder));
     if (!dec) return -1;
+
+    /* Initialize generation to 1 (0 is reserved for "invalid") */
+    dec->surface_generation = 1;
 
     int ret;
 
@@ -530,21 +551,27 @@ fail:
 
 void decoder_destroy(Decoder *dec) {
     if (!dec) return;
+
+    if (dec->frames_decoded > 0) {
+        LOG_INFO("Decoder: %lu frames decoded, %lu DMA-BUF exports",
+                 (unsigned long)dec->frames_decoded,
+                 (unsigned long)dec->dmabuf_exports);
+    }
+
     av_frame_free(&dec->frame);
     av_frame_free(&dec->sw_frame);
     av_packet_free(&dec->packet);
-    /*
-     * Note: avcodec_free_context() handles both closing and freeing.
-     * avcodec_close() was removed in FFmpeg 7.0+
-     */
     avcodec_free_context(&dec->codec_ctx);
     av_buffer_unref(&dec->hw_ctx);
     avformat_close_input(&dec->fmt_ctx);
     free(dec);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DMA-BUF export
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 #ifdef HAVE_VAAPI
-/* Export VA-API surface as DMA-BUF for zero-copy rendering */
 static bool export_vaapi_dmabuf(Decoder *dec, AVFrame *f, Frame *frame) {
     if (f->format != AV_PIX_FMT_VAAPI) return false;
 
@@ -580,7 +607,11 @@ static bool export_vaapi_dmabuf(Decoder *dec, AVFrame *f, Frame *frame) {
 
     frame->type = FRAME_HW;
     frame->hw.surface_id = (uintptr_t)surface;
-    frame->hw.generation = dec->surface_generation++;
+    /*
+     * Use stable generation - changes only on seek/loop.
+     * This allows EGL cache to hit when the same VA surface is reused.
+     */
+    frame->hw.generation = dec->surface_generation;
 
     DmaBuf *dmabuf = &frame->hw.dmabuf;
     memset(dmabuf, 0, sizeof(*dmabuf));
@@ -608,7 +639,11 @@ static bool export_vaapi_dmabuf(Decoder *dec, AVFrame *f, Frame *frame) {
                     dmabuf->fd[idx] = desc.objects[obj].fd;
                     taken[obj] = true;
                 } else {
+                    /* Need duplicate FD for multi-plane access */
                     dmabuf->fd[idx] = dup(desc.objects[obj].fd);
+                    if (dmabuf->fd[idx] < 0) {
+                        LOG_WARN("Failed to dup DMA-BUF fd");
+                    }
                 }
                 dmabuf->modifier[idx] = desc.objects[obj].drm_format_modifier;
             }
@@ -619,14 +654,21 @@ static bool export_vaapi_dmabuf(Decoder *dec, AVFrame *f, Frame *frame) {
     }
 
     /* Close any object FDs we didn't use */
-    for (uint32_t i = 0; i < desc.num_objects; i++)
-        if (!taken[i]) close(desc.objects[i].fd);
+    for (uint32_t i = 0; i < desc.num_objects; i++) {
+        if (!taken[i]) {
+            close(desc.objects[i].fd);
+        }
+    }
 
+    dec->dmabuf_exports++;
     return dmabuf->num_planes > 0;
 }
 #endif
 
-/* Copy frame data to preallocated ring buffer for software rendering */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Software frame extraction
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 static bool extract_sw_frame(Decoder *dec, Frame *frame, SoftwareRing *ring) {
     AVFrame *src = dec->frame;
 
@@ -708,6 +750,10 @@ static bool extract_sw_frame(Decoder *dec, Frame *frame, SoftwareRing *ring) {
     return true;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Frame decoding
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 bool decoder_get_frame(Decoder *dec, Frame *frame, SoftwareRing *ring, bool need_sw) {
     int ret;
 
@@ -726,6 +772,11 @@ bool decoder_get_frame(Decoder *dec, Frame *frame, SoftwareRing *ring, bool need
             frame->type = FRAME_SW;
             frame->sw.available = false;
 
+            /* Initialize DMA-BUF FDs to invalid to ensure clean state */
+            for (int i = 0; i < 4; i++) {
+                frame->hw.dmabuf.fd[i] = -1;
+            }
+
             bool hw_ok = false;
 
 #ifdef HAVE_VAAPI
@@ -743,6 +794,7 @@ bool decoder_get_frame(Decoder *dec, Frame *frame, SoftwareRing *ring, bool need
                 }
             }
 
+            dec->frames_decoded++;
             return hw_ok || frame->sw.available;
         }
 
@@ -784,6 +836,10 @@ bool decoder_get_frame(Decoder *dec, Frame *frame, SoftwareRing *ring, bool need
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Seek and control
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 int decoder_seek_start(Decoder *dec) {
     int ret = av_seek_frame(dec->fmt_ctx, dec->stream_idx, 0, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
@@ -792,7 +848,15 @@ int decoder_seek_start(Decoder *dec) {
     }
     avcodec_flush_buffers(dec->codec_ctx);
     dec->eof = false;
-    dec->surface_generation += 100;
+
+    /*
+     * Increment generation on seek. This invalidates EGL cache entries
+     * for the old surfaces, but allows the cache to work within the new
+     * playback session.
+     */
+    dec->surface_generation++;
+    LOG_DEBUG("Decoder seek: generation now %lu", (unsigned long)dec->surface_generation);
+
     return 0;
 }
 
@@ -827,6 +891,22 @@ void decoder_set_dmabuf_export_result(Decoder *dec, bool works) {
     dec->dmabuf_export_tested = true;
     dec->dmabuf_export_works = works;
 }
+
+/*
+ * Explicitly increment surface generation. Call when:
+ * - Renderer is reset due to compositor restart
+ * - EGL context is lost
+ * This ensures old EGL cache entries are invalidated.
+ */
+void decoder_increment_generation(Decoder *dec) {
+    if (!dec) return;
+    dec->surface_generation++;
+    LOG_DEBUG("Decoder generation incremented to %lu", (unsigned long)dec->surface_generation);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Ring buffer
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 int sw_ring_init(SoftwareRing *ring, int width, int height) {
     ring->width = width;

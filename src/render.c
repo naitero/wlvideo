@@ -9,6 +9,11 @@
  *
  * EGLImage cache avoids repeated eglCreateImageKHR calls for the same surface.
  * Cache entries are keyed by (surface_id, generation) to handle surface reuse.
+ *
+ * Key design decisions:
+ * - dmabuf_tested/dmabuf_works track driver compatibility, not surface state
+ * - Clear cache on surface changes, but preserve compatibility state
+ * - Reset compatibility only on actual EGL context loss
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -65,6 +70,8 @@ static GpuVendor vendor_from_gl_renderer(const char *renderer) {
     if (strstr(lower, "amd") || strstr(lower, "radeon")) return GPU_VENDOR_AMD;
     return GPU_VENDOR_UNKNOWN;
 }
+
+/* --- Shaders --- */
 
 /* Vertex shader: simple transform with scale/offset */
 static const char *vert_src =
@@ -129,6 +136,8 @@ static const char *frag_external_src =
     "    gl_FragColor = texture2D(u_tex, v_uv);\n"
     "}\n";
 
+/* --- Cache entry --- */
+
 typedef struct {
     uintptr_t surface_id;
     uint64_t generation;
@@ -136,33 +145,59 @@ typedef struct {
     uint64_t last_use;
 } CacheEntry;
 
+/* --- Renderer structure --- */
+
 struct Renderer {
     EGLDisplay dpy;
     EGLContext ctx;
     EGLConfig cfg;
 
+    /* Shader programs */
     GLuint prog_nv12, prog_ext;
     GLint u_transform_nv12, u_tex_y, u_tex_uv, u_colorspace, u_range;
     GLint u_transform_ext, u_tex_ext;
 
+    /* Geometry and textures */
     GLuint vbo;
     GLuint tex_y, tex_uv, tex_dmabuf;
-    int tex_w, tex_h;
+
+    /* Software upload texture state (moved from static variables) */
+    int tex_y_w, tex_y_h;       /* Y texture dimensions */
+    int tex_uv_w, tex_uv_h;     /* UV texture dimensions */
     bool tex_allocated;
 
+    /* EGLImage cache */
     CacheEntry cache[EGL_CACHE_SIZE];
     uint64_t frame_count;
 
+    /* Driver capability flags */
     bool has_dmabuf;
     bool has_modifiers;
     bool has_yuv_hint;
     bool has_rg_texture;
+
+    /*
+     * DMA-BUF import compatibility state.
+     * These track whether the driver can import DMA-BUFs at all,
+     * NOT whether a specific surface is cached. They should only
+     * be reset on actual EGL context loss, not on surface recreation.
+     */
     bool dmabuf_tested;
     bool dmabuf_works;
+
+    /* Statistics */
+    uint64_t stat_cache_hits;
+    uint64_t stat_cache_misses;
+    uint64_t stat_egl_creates;
+    uint64_t stat_egl_destroys;
 
     char gl_renderer[128];
     GpuVendor gpu_vendor;
 };
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Shader compilation
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 static GLuint compile_shader(GLenum type, const char *src) {
     GLuint sh = glCreateShader(type);
@@ -224,6 +259,10 @@ static bool has_egl_extension(EGLDisplay dpy, const char *ext) {
     }
     return false;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Initialization and destruction
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 int renderer_init(Renderer **out, struct wl_display *display) {
     Renderer *r = calloc(1, sizeof(Renderer));
@@ -338,11 +377,16 @@ fail:
 void renderer_destroy(Renderer *r) {
     if (!r) return;
 
+    renderer_log_stats(r);
+
     eglMakeCurrent(r->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, r->ctx);
 
-    for (int i = 0; i < EGL_CACHE_SIZE; i++)
-        if (r->cache[i].image != EGL_NO_IMAGE)
+    for (int i = 0; i < EGL_CACHE_SIZE; i++) {
+        if (r->cache[i].image != EGL_NO_IMAGE) {
             eglDestroyImageKHR(r->dpy, r->cache[i].image);
+            r->stat_egl_destroys++;
+        }
+    }
 
     glDeleteTextures(1, &r->tex_y);
     glDeleteTextures(1, &r->tex_uv);
@@ -365,14 +409,37 @@ const char *renderer_get_gl_renderer(Renderer *r) {
     return r ? r->gl_renderer : NULL;
 }
 
+void renderer_log_stats(Renderer *r) {
+    if (!r) return;
+    if (r->stat_cache_hits + r->stat_cache_misses > 0) {
+        LOG_INFO("EGL cache: %lu hits, %lu misses (%.1f%% hit rate)",
+                 (unsigned long)r->stat_cache_hits,
+                 (unsigned long)r->stat_cache_misses,
+                 100.0 * r->stat_cache_hits / (r->stat_cache_hits + r->stat_cache_misses));
+    }
+    if (r->stat_egl_creates > 0) {
+        LOG_INFO("EGLImage: %lu created, %lu destroyed",
+                 (unsigned long)r->stat_egl_creates,
+                 (unsigned long)r->stat_egl_destroys);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Output management
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 int renderer_create_output(Renderer *r, Output *out) {
     out->egl_window = wl_egl_window_create(out->surface, out->width, out->height);
-    if (!out->egl_window) return -1;
+    if (!out->egl_window) {
+        LOG_ERROR("Output %s: wl_egl_window_create failed", out->name);
+        return -1;
+    }
 
     out->egl_surface = eglCreateWindowSurface(r->dpy, r->cfg, (EGLNativeWindowType)out->egl_window, NULL);
     if (out->egl_surface == EGL_NO_SURFACE) {
         EGLint err = eglGetError();
-        LOG_ERROR("eglCreateWindowSurface failed: %s (0x%x)", egl_error_name(err), err);
+        LOG_ERROR("Output %s: eglCreateWindowSurface failed: %s (0x%x)",
+                  out->name, egl_error_name(err), err);
         if (g_app && (err == EGL_BAD_ALLOC || err == EGL_BAD_SURFACE ||
                       err == EGL_BAD_NATIVE_WINDOW || err == EGL_CONTEXT_LOST))
             g_app->renderer_needs_reset = true;
@@ -380,6 +447,8 @@ int renderer_create_output(Renderer *r, Output *out) {
         out->egl_window = NULL;
         return -1;
     }
+
+    LOG_DEBUG("Output %s: EGL surface created", out->name);
     return 0;
 }
 
@@ -394,6 +463,7 @@ void renderer_destroy_output(Renderer *r, Output *out) {
         }
         eglDestroySurface(r->dpy, out->egl_surface);
         out->egl_surface = EGL_NO_SURFACE;
+        LOG_DEBUG("Output %s: EGL surface destroyed", out->name);
     }
     if (out->egl_window) {
         wl_egl_window_destroy(out->egl_window);
@@ -401,25 +471,74 @@ void renderer_destroy_output(Renderer *r, Output *out) {
     }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Cache and state management
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Clear the EGLImage cache. Call when:
+ * - Surfaces are recreated (cached images are no longer valid)
+ * - Seeking to a new position (surface generations changed)
+ *
+ * Does NOT reset DMA-BUF compatibility state - that's driver-level,
+ * not surface-level.
+ */
 void renderer_clear_cache(Renderer *r) {
     if (!r) return;
 
     eglMakeCurrent(r->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, r->ctx);
 
+    int cleared = 0;
     for (int i = 0; i < EGL_CACHE_SIZE; i++) {
         if (r->cache[i].image != EGL_NO_IMAGE) {
             eglDestroyImageKHR(r->dpy, r->cache[i].image);
             r->cache[i].image = EGL_NO_IMAGE;
+            r->stat_egl_destroys++;
+            cleared++;
         }
         r->cache[i].surface_id = 0;
+        r->cache[i].generation = 0;
     }
 
-    /* Reset DMA-BUF import state so we retry after surface recreation */
+    if (cleared > 0) {
+        LOG_DEBUG("EGL cache cleared (%d images)", cleared);
+    }
+}
+
+/*
+ * Reset DMA-BUF compatibility state. Call ONLY when:
+ * - EGL context is actually lost (EGL_CONTEXT_LOST)
+ * - Renderer is being recreated after compositor restart
+ *
+ * This forces re-testing of DMA-BUF import capability.
+ */
+void renderer_reset_dmabuf_state(Renderer *r) {
+    if (!r) return;
+
     r->dmabuf_tested = false;
     r->dmabuf_works = false;
-
-    LOG_DEBUG("EGL cache cleared, DMA-BUF state reset");
+    LOG_DEBUG("DMA-BUF compatibility state reset");
 }
+
+/*
+ * Reset texture allocation state. Call when:
+ * - Renderer is being recreated
+ * - Video dimensions might have changed
+ */
+void renderer_reset_texture_state(Renderer *r) {
+    if (!r) return;
+
+    r->tex_y_w = 0;
+    r->tex_y_h = 0;
+    r->tex_uv_w = 0;
+    r->tex_uv_h = 0;
+    r->tex_allocated = false;
+    LOG_DEBUG("Texture state reset");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Rendering helpers
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* Compute scale transform for aspect ratio */
 static void compute_transform(float *out, int vid_w, int vid_h, int out_w, int out_h, ScaleMode mode) {
@@ -444,40 +563,63 @@ static void compute_transform(float *out, int vid_w, int vid_h, int out_w, int o
 }
 
 /* Find or allocate cache entry for surface */
-static CacheEntry *cache_get(Renderer *r, uintptr_t surface_id, uint64_t generation) {
+static CacheEntry *cache_get(Renderer *r, uintptr_t surface_id, uint64_t generation, bool *is_hit) {
+    *is_hit = false;
+
     /* Look for existing entry */
-    for (int i = 0; i < EGL_CACHE_SIZE; i++)
-        if (r->cache[i].surface_id == surface_id && r->cache[i].generation == generation)
+    for (int i = 0; i < EGL_CACHE_SIZE; i++) {
+        if (r->cache[i].surface_id == surface_id &&
+            r->cache[i].generation == generation &&
+            r->cache[i].image != EGL_NO_IMAGE) {
+            *is_hit = true;
+            r->stat_cache_hits++;
             return &r->cache[i];
+        }
+    }
+
+    r->stat_cache_misses++;
 
     /* Find empty or LRU slot */
     int best = 0;
     uint64_t oldest = r->cache[0].last_use;
     for (int i = 0; i < EGL_CACHE_SIZE; i++) {
-        if (r->cache[i].surface_id == 0) { best = i; break; }
-        if (r->cache[i].last_use < oldest) { oldest = r->cache[i].last_use; best = i; }
+        if (r->cache[i].surface_id == 0 || r->cache[i].image == EGL_NO_IMAGE) {
+            best = i;
+            break;
+        }
+        if (r->cache[i].last_use < oldest) {
+            oldest = r->cache[i].last_use;
+            best = i;
+        }
     }
 
     CacheEntry *e = &r->cache[best];
     if (e->image != EGL_NO_IMAGE) {
         eglDestroyImageKHR(r->dpy, e->image);
         e->image = EGL_NO_IMAGE;
+        r->stat_egl_destroys++;
     }
     e->surface_id = surface_id;
     e->generation = generation;
     return e;
 }
 
-/* Render frame via DMA-BUF import (zero-copy path) */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DMA-BUF rendering (zero-copy path)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 static bool render_dmabuf(Renderer *r, Output *out, Frame *frame, ScaleMode scale) {
     if (!r->has_dmabuf || !r->prog_ext) return false;
     if (r->dmabuf_tested && !r->dmabuf_works) return false;
 
     DmaBuf *dmabuf = &frame->hw.dmabuf;
 
-    /* Build EGL attributes */
-    CacheEntry *ce = cache_get(r, frame->hw.surface_id, frame->hw.generation);
-    if (ce->image == EGL_NO_IMAGE) {
+    /* Check cache */
+    bool cache_hit;
+    CacheEntry *ce = cache_get(r, frame->hw.surface_id, frame->hw.generation, &cache_hit);
+
+    if (!cache_hit) {
+        /* Need to create new EGLImage */
         uint64_t mod[4];
         for (int i = 0; i < 4; i++)
             mod[i] = (dmabuf->modifier[i] == DRM_FORMAT_MOD_INVALID) ? DRM_FORMAT_MOD_LINEAR : dmabuf->modifier[i];
@@ -544,6 +686,7 @@ static bool render_dmabuf(Renderer *r, Output *out, Frame *frame, ScaleMode scal
         attr[i++] = EGL_NONE;
 
         ce->image = eglCreateImageKHR(r->dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attr);
+        r->stat_egl_creates++;
 
         if (ce->image == EGL_NO_IMAGE) {
             EGLint err = eglGetError();
@@ -592,7 +735,10 @@ static bool render_dmabuf(Renderer *r, Output *out, Frame *frame, ScaleMode scal
     return true;
 }
 
-/* Render frame via software upload */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Software rendering
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 static void render_software(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, ScaleMode scale) {
     int slot = frame->sw.ring_slot;
     const uint8_t *y_data = sw_ring_get_y(ring, slot);
@@ -611,9 +757,13 @@ static void render_software(Renderer *r, Output *out, Frame *frame, SoftwareRing
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    if (!r->tex_allocated || r->tex_w != w || r->tex_h != h) {
+    /* Reallocate Y texture if dimensions changed */
+    if (r->tex_y_w != w || r->tex_y_h != h) {
         glTexImage2D(GL_TEXTURE_2D, 0, y_fmt, w, h, 0, y_fmt, GL_UNSIGNED_BYTE, NULL);
-        r->tex_w = w; r->tex_h = h; r->tex_allocated = true;
+        r->tex_y_w = w;
+        r->tex_y_h = h;
+        r->tex_allocated = true;
+        LOG_DEBUG("Y texture reallocated: %dx%d", w, h);
     }
 
     if (ring->y_stride == w)
@@ -630,10 +780,13 @@ static void render_software(Renderer *r, Output *out, Frame *frame, SoftwareRing
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
     int uv_w = w / 2, uv_h = h / 2;
-    static int prev_uv_w = 0, prev_uv_h = 0;
-    if (prev_uv_w != uv_w || prev_uv_h != uv_h) {
+
+    /* Reallocate UV texture if dimensions changed */
+    if (r->tex_uv_w != uv_w || r->tex_uv_h != uv_h) {
         glTexImage2D(GL_TEXTURE_2D, 0, uv_fmt, uv_w, uv_h, 0, uv_fmt, GL_UNSIGNED_BYTE, NULL);
-        prev_uv_w = uv_w; prev_uv_h = uv_h;
+        r->tex_uv_w = uv_w;
+        r->tex_uv_h = uv_h;
+        LOG_DEBUG("UV texture reallocated: %dx%d", uv_w, uv_h);
     }
 
     if (ring->uv_stride == w)
@@ -669,16 +822,21 @@ static void render_software(Renderer *r, Output *out, Frame *frame, SoftwareRing
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Main draw function
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, ScaleMode scale, bool try_dmabuf) {
     /* Validate EGL surface before attempting to render */
     if (!out->egl_surface || out->egl_surface == EGL_NO_SURFACE) {
-        LOG_DEBUG("No EGL surface for %s", out->name);
+        LOG_DEBUG("Output %s: no EGL surface", out->name);
         return false;
     }
 
     if (!eglMakeCurrent(r->dpy, out->egl_surface, out->egl_surface, r->ctx)) {
         EGLint err = eglGetError();
-        LOG_WARN("eglMakeCurrent failed for %s: %s (0x%x)", out->name, egl_error_name(err), err);
+        LOG_WARN("Output %s: eglMakeCurrent failed: %s (0x%x)",
+                 out->name, egl_error_name(err), err);
         if (g_app && (err == EGL_BAD_SURFACE || err == EGL_BAD_NATIVE_WINDOW || err == EGL_CONTEXT_LOST))
             g_app->renderer_needs_reset = true;
         return false;
@@ -700,14 +858,16 @@ bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, S
     if (!eglSwapBuffers(r->dpy, out->egl_surface)) {
         EGLint err = eglGetError();
         if (err == EGL_BAD_SURFACE || err == EGL_BAD_NATIVE_WINDOW) {
-            LOG_WARN("eglSwapBuffers failed for %s: %s (surface invalid)", out->name, egl_error_name(err));
+            LOG_WARN("Output %s: eglSwapBuffers failed: %s (surface invalid)",
+                     out->name, egl_error_name(err));
             if (g_app) g_app->renderer_needs_reset = true;
             return false;
         }
         if (err == EGL_CONTEXT_LOST && g_app)
             g_app->renderer_needs_reset = true;
         /* Other errors might be transient, log but don't fail */
-        LOG_DEBUG("eglSwapBuffers warning for %s: %s (0x%x)", out->name, egl_error_name(err), err);
+        LOG_DEBUG("Output %s: eglSwapBuffers warning: %s (0x%x)",
+                  out->name, egl_error_name(err), err);
     }
 
     return dmabuf_ok;

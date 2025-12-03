@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 #include <wayland-client.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -93,11 +94,29 @@ typedef struct {
     uint64_t last_use;
 } EglCacheEntry;
 
+/*
+ * Output state machine:
+ *
+ *   OUT_UNCONFIGURED ──[first configure]──► OUT_READY
+ *         ▲                                    │
+ *         │                          [request_frame]
+ *         │                                    ▼
+ *   [create_surface]               OUT_WAITING_CALLBACK
+ *         │                                    │
+ *         │                           [frame_done]
+ *         │                                    │
+ *   OUT_PENDING_RECREATE ◄────────────────────┘
+ *         ▲                                    │
+ *         │                          [layer_closed]
+ *         │                                    ▼
+ *   [cleanup done]◄───────────── OUT_PENDING_DESTROY
+ */
 typedef enum {
-    OUT_UNCONFIGURED,
-    OUT_READY,
-    OUT_WAITING_CALLBACK,
-    OUT_CLOSED,  /* Layer surface was closed by compositor */
+    OUT_UNCONFIGURED,        /* Initial state, waiting for first configure */
+    OUT_READY,               /* Configured and ready to render */
+    OUT_WAITING_CALLBACK,    /* Waiting for frame callback */
+    OUT_PENDING_DESTROY,     /* layer_closed received, waiting for cleanup */
+    OUT_PENDING_RECREATE,    /* Cleanup done, waiting to recreate */
 } OutputState;
 
 typedef struct Output {
@@ -119,10 +138,8 @@ typedef struct Output {
     OutputState state;
     uint64_t frames_rendered;
 
-    /* Flags for deferred lifecycle management */
-    bool needs_surface_destroy;  /* Set when layer_closed received */
-    bool needs_surface_create;   /* Set when output ready for new surface */
-    bool surface_ever_created;   /* Track if we already tried to create surface */
+    /* Track configured dimensions to detect actual changes */
+    int configured_width, configured_height;
 } Output;
 
 typedef struct Decoder Decoder;
@@ -166,14 +183,46 @@ typedef struct App {
 
 extern App *g_app;
 
-/* Logging */
-#define LOG_ERROR(fmt, ...) fprintf(stderr, "\033[31m[ERROR]\033[0m " fmt "\n", ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  fprintf(stderr, "\033[33m[WARN]\033[0m " fmt "\n", ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  do { if (g_app && g_app->config.verbose) fprintf(stderr, "\033[32m[INFO]\033[0m " fmt "\n", ##__VA_ARGS__); } while(0)
-#define LOG_DEBUG(fmt, ...) do { if (g_app && g_app->config.verbose) fprintf(stderr, "\033[34m[DEBUG]\033[0m " fmt "\n", ##__VA_ARGS__); } while(0)
+/* --- Logging ---
+ *
+ * All log macros include monotonic timestamp for debugging timing issues.
+ * Format: [LEVEL T+seconds.milliseconds] message
+ */
+
+static inline double log_timestamp(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* Start time for relative timestamps (set in main) */
+extern double g_log_start_time;
+
+#define LOG_ERROR(fmt, ...) \
+    fprintf(stderr, "\033[31m[ERROR T+%.3f]\033[0m " fmt "\n", \
+            log_timestamp() - g_log_start_time, ##__VA_ARGS__)
+
+#define LOG_WARN(fmt, ...) \
+    fprintf(stderr, "\033[33m[WARN  T+%.3f]\033[0m " fmt "\n", \
+            log_timestamp() - g_log_start_time, ##__VA_ARGS__)
+
+#define LOG_INFO(fmt, ...) \
+    do { \
+        if (g_app && g_app->config.verbose) \
+            fprintf(stderr, "\033[32m[INFO  T+%.3f]\033[0m " fmt "\n", \
+                    log_timestamp() - g_log_start_time, ##__VA_ARGS__); \
+    } while(0)
+
+#define LOG_DEBUG(fmt, ...) \
+    do { \
+        if (g_app && g_app->config.verbose) \
+            fprintf(stderr, "\033[34m[DEBUG T+%.3f]\033[0m " fmt "\n", \
+                    log_timestamp() - g_log_start_time, ##__VA_ARGS__); \
+    } while(0)
 
 /* Utilities */
 const char *fourcc_to_str(uint32_t fourcc);
+const char *output_state_name(OutputState state);
 
 /* Decoder */
 int decoder_init(Decoder **dec, const char *path, bool hw_accel, const char *gpu);
@@ -185,6 +234,7 @@ void decoder_close_dmabuf(DmaBuf *dmabuf);
 GpuVendor decoder_get_gpu_vendor(Decoder *dec);
 bool decoder_dmabuf_export_supported(Decoder *dec);
 void decoder_set_dmabuf_export_result(Decoder *dec, bool works);
+void decoder_increment_generation(Decoder *dec);
 
 /* Renderer */
 int renderer_init(Renderer **r, struct wl_display *display);
@@ -193,8 +243,11 @@ int renderer_create_output(Renderer *r, Output *out);
 void renderer_destroy_output(Renderer *r, Output *out);
 bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, ScaleMode scale, bool try_dmabuf);
 void renderer_clear_cache(Renderer *r);
+void renderer_reset_dmabuf_state(Renderer *r);
+void renderer_reset_texture_state(Renderer *r);
 GpuVendor renderer_get_gpu_vendor(Renderer *r);
 const char *renderer_get_gl_renderer(Renderer *r);
+void renderer_log_stats(Renderer *r);
 
 /* Wayland */
 int wayland_init(App *app);
