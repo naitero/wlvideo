@@ -1,0 +1,95 @@
+.TH WLVIDEO 1 "2025" "wlvideo 0.0.1" "User Commands"
+.SH NAME
+wlvideo \- lightweight video wallpaper for Wayland
+.SH SYNOPSIS
+.B wlvideo
+[\fIOPTIONS\fR] \fIVIDEO\fR
+.SH DESCRIPTION
+.B wlvideo
+is a high-performance video wallpaper application for Wayland compositors
+that implement the wlr-layer-shell protocol (such as Sway and Hyprland).
+.PP
+It achieves minimal memory usage through hardware-accelerated decoding (VA-API)
+and zero-copy frame transfer via DMA-BUF.
+.SH OPTIONS
+.TP
+.BR \-o ", " \-\-output " " \fINAME\fR
+Set the video wallpaper on the specified output only.
+Use '*' for all outputs (default).
+.TP
+.BR \-g ", " \-\-gpu " " \fIPATH\fR
+Use the given VA-API render node (e.g. /dev/dri/renderD128).
+If it does not match the GL renderer GPU, wlvideo will prefer the renderer GPU unless WLVIDEO_ALLOW_GPU_MISMATCH=1 is set.
+.TP
+.BR \-s ", " \-\-scale " " \fIMODE\fR
+Set the scaling mode. Available modes:
+.RS
+.IP "\fBfit\fR"
+Scale video to fit within the output, maintaining aspect ratio (letterbox).
+.IP "\fBfill\fR"
+Scale video to fill the output, cropping if necessary (default).
+.IP "\fBstretch\fR"
+Stretch video to fill the output, ignoring aspect ratio.
+.RE
+.TP
+.BR \-l ", " \-\-no\-loop
+Do not loop the video. Exit when playback completes.
+.TP
+.BR \-n ", " \-\-no\-hwaccel
+Disable hardware-accelerated decoding. Forces software decoding.
+.TP
+.BR \-v ", " \-\-verbose
+Enable verbose output for debugging.
+.TP
+.BR \-h ", " \-\-help
+Show help message and exit.
+.SH EXAMPLES
+.TP
+Play video on all outputs:
+.B wlvideo /path/to/video.mp4
+.TP
+Play on specific output:
+.B wlvideo -o DP-1 /path/to/video.mp4
+.TP
+Use fit scaling (letterbox):
+.B wlvideo --scale fit /path/to/video.mp4
+.SH SUPPORTED FORMATS
+Any video format supported by FFmpeg, including:
+.IP \[bu] 2
+MP4 (H.264, H.265/HEVC)
+.IP \[bu]
+WebM (VP8, VP9, AV1)
+.IP \[bu]
+MKV
+.IP \[bu]
+GIF
+.SH ENVIRONMENT
+.TP
+.B WAYLAND_DISPLAY
+The Wayland display to connect to.
+.TP
+.B LIBVA_DRIVER_NAME
+Set to \fInvidia\fR when using nvidia-vaapi-driver.
+.TP
+.B NVD_BACKEND
+For nvidia-vaapi-driver; \fIdirect\fR is recommended.
+.TP
+.B WLVIDEO_ALLOW_GPU_MISMATCH
+If set, wlvideo will honor \-\-gpu even when it differs from the GL renderer GPU.
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Error (failed to initialize, file not found, etc.)
+.SH SEE ALSO
+.BR swaybg (1),
+.BR mpvpaper (1),
+.BR ffmpeg (1)
+.SH BUGS
+Report bugs at: https://github.com/naitero/wlvideo/issues
+.SH AUTHOR
+Written by naitero.
+.SH LICENSE
+MIT
