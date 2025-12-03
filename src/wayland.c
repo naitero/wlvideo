@@ -3,6 +3,10 @@
  *
  * Creates a background layer surface that covers the entire output.
  * Frame callbacks throttle rendering to display refresh rate.
+ *
+ * Lifecycle: When the compositor sends layer_surface::closed (e.g., during
+ * compositor restart), we must destroy resources and can recreate them
+ * when the output becomes available again.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -21,6 +25,14 @@
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *surf,
                             uint32_t serial, uint32_t w, uint32_t h) {
     Output *out = data;
+
+    /* Ignore configures if we're in closed state waiting for cleanup */
+    if (out->state == OUT_CLOSED) {
+        zwlr_layer_surface_v1_ack_configure(surf, serial);
+        LOG_DEBUG("Ignoring configure for closed output %s", out->name);
+        return;
+    }
+
     out->width = w;
     out->height = h;
 
@@ -38,8 +50,38 @@ static void layer_configure(void *data, struct zwlr_layer_surface_v1 *surf,
 static void layer_closed(void *data, struct zwlr_layer_surface_v1 *surf) {
     (void)surf;
     Output *out = data;
-    LOG_INFO("Output %s closed", out->name);
-    out->state = OUT_UNCONFIGURED;
+
+    LOG_INFO("Output %s: layer surface closed by compositor", out->name);
+    if (g_app)
+        g_app->renderer_needs_reset = true;
+
+    /*
+     * Per wlr-layer-shell protocol: "The client should destroy the resource
+     * after receiving this event, and create a new surface if they so choose."
+     *
+     * We can't destroy the layer_surface synchronously here (we're in its
+     * callback), so we flag it for deferred destruction in the main loop.
+     * The EGL resources can be destroyed immediately since we're not in
+     * an EGL callback.
+     */
+
+    /* Destroy EGL resources immediately */
+    if (g_app && g_app->renderer) {
+        renderer_destroy_output(g_app->renderer, out);
+    }
+
+    /* Destroy frame callback if pending */
+    if (out->frame_callback) {
+        wl_callback_destroy(out->frame_callback);
+        out->frame_callback = NULL;
+    }
+
+    /* Flag for deferred Wayland resource destruction */
+    out->needs_surface_destroy = true;
+    out->state = OUT_CLOSED;
+
+    /* Allow recreation once cleanup is done */
+    out->surface_ever_created = false;
 }
 
 static const struct zwlr_layer_surface_v1_listener layer_listener = {
@@ -65,6 +107,7 @@ static const struct wl_callback_listener frame_listener = {
 
 void wayland_request_frame(Output *out) {
     if (!out->surface) return;
+    if (out->state == OUT_CLOSED) return;
 
     if (out->frame_callback) {
         wl_callback_destroy(out->frame_callback);
@@ -96,7 +139,21 @@ static void output_mode(void *data, struct wl_output *o, uint32_t flags, int32_t
 }
 
 static void output_done(void *data, struct wl_output *o) {
-    (void)data; (void)o;
+    (void)o;
+    Output *out = data;
+
+    /*
+     * output::done indicates the output info is complete.
+     * If this output has no surface and hasn't been flagged yet,
+     * mark it for surface creation.
+     */
+    if (!out->surface && !out->needs_surface_create &&
+        !out->surface_ever_created &&
+        out->width > 0 && out->height > 0 && out->name[0]) {
+        LOG_DEBUG("Output %s ready for surface creation (%dx%d)",
+                  out->name, out->width, out->height);
+        out->needs_surface_create = true;
+    }
 }
 
 static void output_scale(void *data, struct wl_output *o, int32_t scale) {
@@ -144,10 +201,15 @@ static void registry_global(void *data, struct wl_registry *reg, uint32_t name,
         out->wl_name = name;
         out->scale = 1;
         out->state = OUT_UNCONFIGURED;
+        out->needs_surface_destroy = false;
+        out->needs_surface_create = false;
+        out->surface_ever_created = false;
         out->wl_output = wl_registry_bind(reg, name, &wl_output_interface, ver < 4 ? ver : 4);
 
         wl_output_add_listener(out->wl_output, &output_listener, out);
         wl_list_insert(&app->outputs, &out->link);
+
+        LOG_DEBUG("Registered output wl_name=%u", name);
     }
 }
 
@@ -158,9 +220,13 @@ static void registry_remove(void *data, struct wl_registry *reg, uint32_t name) 
     Output *out, *tmp;
     wl_list_for_each_safe(out, tmp, &app->outputs, link) {
         if (out->wl_name == name) {
-            LOG_INFO("Output removed: %s", out->name);
+            LOG_INFO("Output removed: %s (wl_name=%u)", out->name, name);
             wl_list_remove(&out->link);
 
+            /* Clean up all resources */
+            if (g_app && g_app->renderer) {
+                renderer_destroy_output(g_app->renderer, out);
+            }
             if (out->frame_callback) wl_callback_destroy(out->frame_callback);
             if (out->layer_surface) zwlr_layer_surface_v1_destroy(out->layer_surface);
             if (out->surface) wl_surface_destroy(out->surface);
@@ -257,6 +323,9 @@ int wayland_create_surface(Output *out, App *app) {
     zwlr_layer_surface_v1_add_listener(out->layer_surface, &layer_listener, out);
     wl_surface_commit(out->surface);
 
+    out->surface_ever_created = true;
+    out->state = OUT_UNCONFIGURED;
+
     return 0;
 }
 
@@ -277,5 +346,6 @@ void wayland_destroy_surface(Output *out) {
         wl_egl_window_destroy(out->egl_window);
         out->egl_window = NULL;
     }
+    out->egl_surface = EGL_NO_SURFACE;
     out->state = OUT_UNCONFIGURED;
 }

@@ -6,6 +6,10 @@
  *
  * When decode can't keep up, we skip frames to catch up with the clock.
  * If we fall too far behind, we reset the clock instead of skipping forever.
+ *
+ * Surface lifecycle: When the compositor restarts, layer surfaces may be
+ * closed. We handle this by destroying old resources and recreating surfaces
+ * when outputs become available again.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -150,6 +154,132 @@ static GpuVendor vendor_from_node(const char *node) {
     }
 }
 
+/* Check if output matches filter criteria */
+static bool output_matches_filter(Output *out, const Config *cfg) {
+    if (!cfg->output_name || strcmp(cfg->output_name, "*") == 0)
+        return true;
+    return strcmp(out->name, cfg->output_name) == 0;
+}
+
+/* Tear down and recreate the EGL renderer and per-output EGL surfaces.
+ * Keeps Wayland surfaces intact when possible; if EGL surface recreation
+ * fails, the Wayland surface is destroyed and marked for full recreation. */
+static bool reset_renderer(App *app) {
+    LOG_INFO("Resetting renderer (EGL context) after surface loss");
+
+    if (app->renderer) {
+        Output *out;
+        wl_list_for_each(out, &app->outputs, link)
+            renderer_destroy_output(app->renderer, out);
+        renderer_destroy(app->renderer);
+        app->renderer = NULL;
+    }
+
+    if (renderer_init(&app->renderer, app->display) < 0) {
+        LOG_ERROR("Renderer reinit failed");
+        return false;
+    }
+
+    /* Recreate EGL surfaces for outputs that still have Wayland surfaces */
+    Output *out;
+    wl_list_for_each(out, &app->outputs, link) {
+        if (!out->surface || out->state == OUT_CLOSED)
+            continue;
+
+        if (!app->renderer) break;
+
+        if (out->state == OUT_READY || out->state == OUT_WAITING_CALLBACK) {
+            if (renderer_create_output(app->renderer, out) == 0) {
+                LOG_INFO("EGL surface recreated for %s", out->name);
+            } else {
+                LOG_WARN("Failed to recreate EGL surface for %s, recreating Wayland surface", out->name);
+                wayland_destroy_surface(out);
+                out->needs_surface_create = true;
+                out->surface_ever_created = false;
+            }
+        }
+    }
+
+    renderer_clear_cache(app->renderer);
+    app->render_path_determined = false;
+    app->renderer_needs_reset = false;
+    return true;
+}
+
+/* Process deferred surface destruction and recreation.
+ * Returns true if any surface was successfully recreated. */
+static bool process_output_lifecycle(App *app) {
+    bool any_recreated = false;
+    Output *out;
+
+    wl_list_for_each(out, &app->outputs, link) {
+        /* Handle deferred destruction from layer_closed */
+        if (out->needs_surface_destroy) {
+            out->needs_surface_destroy = false;
+
+            LOG_DEBUG("Destroying surfaces for %s", out->name);
+
+            /* EGL resources already destroyed in layer_closed */
+            /* Destroy Wayland resources via helper */
+            wayland_destroy_surface(out);
+
+            /* Mark for recreation */
+            out->needs_surface_create = true;
+        }
+
+        /* Recreate surface if needed and output info is complete */
+        if (out->needs_surface_create &&
+            out->width > 0 && out->height > 0 && out->name[0] &&
+            output_matches_filter(out, &app->config)) {
+
+            out->needs_surface_create = false;
+
+            LOG_INFO("Recreating surface for %s", out->name);
+
+            if (wayland_create_surface(out, app) == 0) {
+                /*
+                 * Wait for compositor to send configure event before creating
+                 * EGL surface. Without this, wl_egl_window_create may fail
+                 * because the surface isn't ready yet.
+                 */
+                wl_display_roundtrip(app->display);
+
+                if (out->state == OUT_READY) {
+                    if (renderer_create_output(app->renderer, out) == 0) {
+                        LOG_INFO("Surface recreated successfully for %s", out->name);
+                        any_recreated = true;
+                    } else {
+                        LOG_ERROR("Failed to create EGL surface for %s", out->name);
+                        wayland_destroy_surface(out);
+                        out->needs_surface_create = true;
+                        out->surface_ever_created = false;
+                    }
+                } else {
+                    LOG_WARN("Surface not configured after roundtrip for %s (state=%d)",
+                             out->name, out->state);
+                    wayland_destroy_surface(out);
+                }
+            } else {
+                LOG_ERROR("Failed to create Wayland surface for %s", out->name);
+            }
+        } else if (out->surface && (out->state == OUT_READY || out->state == OUT_WAITING_CALLBACK) &&
+                   (!out->egl_surface || out->egl_surface == EGL_NO_SURFACE)) {
+            /* Wayland surface exists but EGL surface was lost (e.g., after renderer reset) */
+            if (renderer_create_output(app->renderer, out) == 0) {
+                LOG_INFO("EGL surface reattached for %s", out->name);
+                any_recreated = true;
+            } else {
+                LOG_WARN("Failed to reattach EGL surface for %s, recreating surface", out->name);
+                wayland_destroy_surface(out);
+                out->needs_surface_create = true;
+                out->surface_ever_created = false;
+            }
+        }
+    }
+
+    return any_recreated;
+}
+
 int main(int argc, char **argv) {
     App app = {0};
     g_app = &app;
@@ -221,8 +351,7 @@ int main(int argc, char **argv) {
     int surface_count = 0;
     Output *out;
     wl_list_for_each(out, &app.outputs, link) {
-        if (app.config.output_name && strcmp(app.config.output_name, "*") != 0 &&
-            strcmp(out->name, app.config.output_name) != 0)
+        if (!output_matches_filter(out, &app.config))
             continue;
 
         if (wayland_create_surface(out, &app) < 0) {
@@ -267,12 +396,40 @@ int main(int argc, char **argv) {
     const int reset_threshold = max_skip * 2;
 
     while (app.running && !quit) {
+        /* Reset renderer if requested (e.g., after compositor restart) */
+        if (app.renderer_needs_reset) {
+            if (have_frame && frame.type == FRAME_HW) {
+                decoder_close_dmabuf(&frame.hw.dmabuf);
+                have_frame = false;
+            }
+            if (!reset_renderer(&app)) {
+                LOG_ERROR("Renderer reset failed, exiting");
+                break;
+            }
+        }
+
+        /* Process deferred surface lifecycle operations */
+        bool surfaces_recreated = process_output_lifecycle(&app);
+
+        /* After surface recreation, invalidate stale frame data */
+        if (surfaces_recreated) {
+            LOG_INFO("Surfaces recreated, resetting render state");
+            renderer_clear_cache(app.renderer);
+            if (have_frame && frame.type == FRAME_HW) {
+                decoder_close_dmabuf(&frame.hw.dmabuf);
+            }
+            have_frame = false;
+            /* Re-detect render path since surfaces changed */
+            app.render_path_determined = false;
+        }
+
         /* Prepare Wayland events */
         while (wl_display_prepare_read(app.display) != 0)
             wl_display_dispatch_pending(app.display);
 
         if (wl_display_flush(app.display) < 0 && errno != EAGAIN) {
             wl_display_cancel_read(app.display);
+            LOG_ERROR("Wayland display flush failed: %s", strerror(errno));
             break;
         }
 
@@ -297,17 +454,25 @@ int main(int argc, char **argv) {
         if (ret < 0) {
             wl_display_cancel_read(app.display);
             if (errno == EINTR) continue;
+            LOG_ERROR("poll failed: %s", strerror(errno));
             break;
         }
 
         if (ret > 0 && (pfd.revents & POLLIN)) {
-            if (wl_display_read_events(app.display) < 0) break;
+            if (wl_display_read_events(app.display) < 0) {
+                LOG_ERROR("Wayland read events failed");
+                break;
+            }
             wl_display_dispatch_pending(app.display);
         } else {
             wl_display_cancel_read(app.display);
         }
 
-        if (wl_display_get_error(app.display)) break;
+        if (wl_display_get_error(app.display)) {
+            LOG_ERROR("Wayland display error: %d", wl_display_get_error(app.display));
+            break;
+        }
+
         if (!any_output_ready(&app)) continue;
 
         /* Start clock on first ready output */
@@ -375,6 +540,13 @@ int main(int argc, char **argv) {
                 bool try_dmabuf = !app.render_path_determined || app.use_dmabuf_path;
                 bool ok = renderer_draw(app.renderer, out, &frame, &app.sw_ring,
                                         app.config.scale_mode, try_dmabuf);
+
+                /* Handle render failure (e.g., invalid EGL surface) */
+                if (!ok && !frame.sw.available) {
+                    LOG_WARN("Render failed for %s, marking for recreation", out->name);
+                    out->needs_surface_destroy = true;
+                    continue;
+                }
 
                 /* Detect render path on first frame */
                 if (!app.render_path_determined) {

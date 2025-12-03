@@ -97,6 +97,7 @@ typedef enum {
     OUT_UNCONFIGURED,
     OUT_READY,
     OUT_WAITING_CALLBACK,
+    OUT_CLOSED,  /* Layer surface was closed by compositor */
 } OutputState;
 
 typedef struct Output {
@@ -117,6 +118,11 @@ typedef struct Output {
 
     OutputState state;
     uint64_t frames_rendered;
+
+    /* Flags for deferred lifecycle management */
+    bool needs_surface_destroy;  /* Set when layer_closed received */
+    bool needs_surface_create;   /* Set when output ready for new surface */
+    bool surface_ever_created;   /* Track if we already tried to create surface */
 } Output;
 
 typedef struct Decoder Decoder;
@@ -145,6 +151,8 @@ typedef struct App {
     SoftwareRing sw_ring;
 
     Config config;
+
+    bool renderer_needs_reset;
 
     bool running;
     bool clock_started;

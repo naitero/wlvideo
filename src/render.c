@@ -44,6 +44,8 @@ static const char *egl_error_name(EGLint err) {
     case EGL_BAD_MATCH: return "BAD_MATCH";
     case EGL_BAD_PARAMETER: return "BAD_PARAMETER";
     case EGL_BAD_SURFACE: return "BAD_SURFACE";
+    case EGL_BAD_NATIVE_WINDOW: return "BAD_NATIVE_WINDOW";
+    case EGL_CONTEXT_LOST: return "CONTEXT_LOST";
     default: return "UNKNOWN";
     }
 }
@@ -369,6 +371,11 @@ int renderer_create_output(Renderer *r, Output *out) {
 
     out->egl_surface = eglCreateWindowSurface(r->dpy, r->cfg, (EGLNativeWindowType)out->egl_window, NULL);
     if (out->egl_surface == EGL_NO_SURFACE) {
+        EGLint err = eglGetError();
+        LOG_ERROR("eglCreateWindowSurface failed: %s (0x%x)", egl_error_name(err), err);
+        if (g_app && (err == EGL_BAD_ALLOC || err == EGL_BAD_SURFACE ||
+                      err == EGL_BAD_NATIVE_WINDOW || err == EGL_CONTEXT_LOST))
+            g_app->renderer_needs_reset = true;
         wl_egl_window_destroy(out->egl_window);
         out->egl_window = NULL;
         return -1;
@@ -377,7 +384,14 @@ int renderer_create_output(Renderer *r, Output *out) {
 }
 
 void renderer_destroy_output(Renderer *r, Output *out) {
-    if (out->egl_surface) {
+    if (!r) return;
+
+    if (out->egl_surface && out->egl_surface != EGL_NO_SURFACE) {
+        /* Make sure we're not current on this surface before destroying */
+        EGLSurface cur_draw = eglGetCurrentSurface(EGL_DRAW);
+        if (cur_draw == out->egl_surface) {
+            eglMakeCurrent(r->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, r->ctx);
+        }
         eglDestroySurface(r->dpy, out->egl_surface);
         out->egl_surface = EGL_NO_SURFACE;
     }
@@ -399,7 +413,12 @@ void renderer_clear_cache(Renderer *r) {
         }
         r->cache[i].surface_id = 0;
     }
-    LOG_DEBUG("EGL cache cleared");
+
+    /* Reset DMA-BUF import state so we retry after surface recreation */
+    r->dmabuf_tested = false;
+    r->dmabuf_works = false;
+
+    LOG_DEBUG("EGL cache cleared, DMA-BUF state reset");
 }
 
 /* Compute scale transform for aspect ratio */
@@ -651,7 +670,20 @@ static void render_software(Renderer *r, Output *out, Frame *frame, SoftwareRing
 }
 
 bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, ScaleMode scale, bool try_dmabuf) {
-    eglMakeCurrent(r->dpy, out->egl_surface, out->egl_surface, r->ctx);
+    /* Validate EGL surface before attempting to render */
+    if (!out->egl_surface || out->egl_surface == EGL_NO_SURFACE) {
+        LOG_DEBUG("No EGL surface for %s", out->name);
+        return false;
+    }
+
+    if (!eglMakeCurrent(r->dpy, out->egl_surface, out->egl_surface, r->ctx)) {
+        EGLint err = eglGetError();
+        LOG_WARN("eglMakeCurrent failed for %s: %s (0x%x)", out->name, egl_error_name(err), err);
+        if (g_app && (err == EGL_BAD_SURFACE || err == EGL_BAD_NATIVE_WINDOW || err == EGL_CONTEXT_LOST))
+            g_app->renderer_needs_reset = true;
+        return false;
+    }
+
     glViewport(0, 0, out->width, out->height);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -665,6 +697,18 @@ bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, S
     if (!dmabuf_ok && frame->sw.available)
         render_software(r, out, frame, ring, scale);
 
-    eglSwapBuffers(r->dpy, out->egl_surface);
+    if (!eglSwapBuffers(r->dpy, out->egl_surface)) {
+        EGLint err = eglGetError();
+        if (err == EGL_BAD_SURFACE || err == EGL_BAD_NATIVE_WINDOW) {
+            LOG_WARN("eglSwapBuffers failed for %s: %s (surface invalid)", out->name, egl_error_name(err));
+            if (g_app) g_app->renderer_needs_reset = true;
+            return false;
+        }
+        if (err == EGL_CONTEXT_LOST && g_app)
+            g_app->renderer_needs_reset = true;
+        /* Other errors might be transient, log but don't fail */
+        LOG_DEBUG("eglSwapBuffers warning for %s: %s (0x%x)", out->name, egl_error_name(err), err);
+    }
+
     return dmabuf_ok;
 }
