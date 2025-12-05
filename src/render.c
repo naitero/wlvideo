@@ -435,6 +435,36 @@ void renderer_log_stats(Renderer *r) {
  * ================================ */
 
 int renderer_create_output(Renderer *r, Output *out) {
+    /* Validate inputs */
+    if (!r || !out) {
+        LOG_ERROR("renderer_create_output: NULL argument");
+        return -1;
+    }
+
+    if (!out->surface) {
+        LOG_ERROR("Output %s: no Wayland surface", out->name);
+        return -1;
+    }
+
+    if (out->width <= 0 || out->height <= 0) {
+        LOG_ERROR("Output %s: invalid dimensions %dx%d", out->name, out->width, out->height);
+        return -1;
+    }
+
+    /* Clean up any existing EGL resources first */
+    if (out->egl_surface && out->egl_surface != EGL_NO_SURFACE) {
+        EGLSurface cur_draw = eglGetCurrentSurface(EGL_DRAW);
+        if (cur_draw == out->egl_surface) {
+            eglMakeCurrent(r->dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, r->ctx);
+        }
+        eglDestroySurface(r->dpy, out->egl_surface);
+        out->egl_surface = EGL_NO_SURFACE;
+    }
+    if (out->egl_window) {
+        wl_egl_window_destroy(out->egl_window);
+        out->egl_window = NULL;
+    }
+
     out->egl_window = wl_egl_window_create(out->surface, out->width, out->height);
     if (!out->egl_window) {
         LOG_ERROR("Output %s: wl_egl_window_create failed", out->name);
@@ -454,7 +484,7 @@ int renderer_create_output(Renderer *r, Output *out) {
         return -1;
     }
 
-    LOG_DEBUG("Output %s: EGL surface created", out->name);
+    LOG_DEBUG("Output %s: EGL surface created (%dx%d)", out->name, out->width, out->height);
     return 0;
 }
 
@@ -833,9 +863,21 @@ static void render_software(Renderer *r, Output *out, Frame *frame, SoftwareRing
  * ================================ */
 
 bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, ScaleMode scale, bool try_dmabuf) {
+    /* Validate renderer */
+    if (!r || !r->dpy || r->ctx == EGL_NO_CONTEXT) {
+        LOG_DEBUG("Output %s: renderer not initialized", out->name);
+        return false;
+    }
+
     /* Validate EGL surface before attempting to render */
     if (!out->egl_surface || out->egl_surface == EGL_NO_SURFACE) {
         LOG_DEBUG("Output %s: no EGL surface", out->name);
+        return false;
+    }
+
+    /* Validate output dimensions */
+    if (out->width <= 0 || out->height <= 0) {
+        LOG_DEBUG("Output %s: invalid dimensions %dx%d", out->name, out->width, out->height);
         return false;
     }
 
@@ -843,8 +885,12 @@ bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, S
         EGLint err = eglGetError();
         LOG_WARN("Output %s: eglMakeCurrent failed: %s (0x%x)",
                  out->name, egl_error_name(err), err);
-        if (g_app && (err == EGL_BAD_SURFACE || err == EGL_BAD_NATIVE_WINDOW || err == EGL_CONTEXT_LOST))
-            g_app->renderer_needs_reset = true;
+        if (g_app) {
+            if (err == EGL_BAD_SURFACE || err == EGL_BAD_NATIVE_WINDOW ||
+                err == EGL_CONTEXT_LOST || err == EGL_BAD_ALLOC) {
+                g_app->renderer_needs_reset = true;
+            }
+        }
         return false;
     }
 
@@ -869,11 +915,21 @@ bool renderer_draw(Renderer *r, Output *out, Frame *frame, SoftwareRing *ring, S
             if (g_app) g_app->renderer_needs_reset = true;
             return false;
         }
-        if (err == EGL_CONTEXT_LOST && g_app)
-            g_app->renderer_needs_reset = true;
+        if (err == EGL_CONTEXT_LOST) {
+            LOG_WARN("Output %s: EGL context lost", out->name);
+            if (g_app) g_app->renderer_needs_reset = true;
+            return false;
+        }
+        if (err == EGL_BAD_ALLOC) {
+            LOG_WARN("Output %s: EGL allocation failed", out->name);
+            if (g_app) g_app->renderer_needs_reset = true;
+            return false;
+        }
         /* Other errors might be transient, log but don't fail */
-        LOG_DEBUG("Output %s: eglSwapBuffers warning: %s (0x%x)",
-                  out->name, egl_error_name(err), err);
+        if (err != EGL_SUCCESS) {
+            LOG_DEBUG("Output %s: eglSwapBuffers warning: %s (0x%x)",
+                      out->name, egl_error_name(err), err);
+        }
     }
 
     return dmabuf_ok;

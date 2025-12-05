@@ -30,6 +30,7 @@ const char *output_state_name(OutputState state) {
     case OUT_WAITING_CALLBACK: return "WAITING_CALLBACK";
     case OUT_PENDING_DESTROY:  return "PENDING_DESTROY";
     case OUT_PENDING_RECREATE: return "PENDING_RECREATE";
+    case OUT_DEFUNCT:          return "DEFUNCT";
     default:                   return "UNKNOWN";
     }
 }
@@ -45,8 +46,9 @@ static void layer_configure(void *data, struct zwlr_layer_surface_v1 *surf,
     /* Always ack configure first, per protocol requirements */
     zwlr_layer_surface_v1_ack_configure(surf, serial);
 
-    /* Ignore configures if we're in a destruction state */
-    if (out->state == OUT_PENDING_DESTROY || out->state == OUT_PENDING_RECREATE) {
+    /* Ignore configures if we're in a destruction or defunct state */
+    if (out->state == OUT_PENDING_DESTROY || out->state == OUT_PENDING_RECREATE ||
+        out->state == OUT_DEFUNCT) {
         LOG_DEBUG("Output %s: ignoring configure in state %s",
                   out->name, output_state_name(out->state));
         return;
@@ -93,8 +95,9 @@ static void layer_closed(void *data, struct zwlr_layer_surface_v1 *surf) {
              out->name, output_state_name(out->state));
 
     /* Prevent duplicate handling */
-    if (out->state == OUT_PENDING_DESTROY || out->state == OUT_PENDING_RECREATE) {
-        LOG_DEBUG("Output %s: already in destruction state, ignoring", out->name);
+    if (out->state == OUT_PENDING_DESTROY || out->state == OUT_PENDING_RECREATE ||
+        out->state == OUT_DEFUNCT) {
+        LOG_DEBUG("Output %s: already in destruction/defunct state, ignoring", out->name);
         return;
     }
 
@@ -112,10 +115,11 @@ static void layer_closed(void *data, struct zwlr_layer_surface_v1 *surf) {
         renderer_destroy_output(g_app->renderer, out);
     }
 
-    /* Destroy frame callback if pending */
-    if (out->frame_callback) {
-        wl_callback_destroy(out->frame_callback);
-        out->frame_callback = NULL;
+    /* Destroy frame callback if pending - set to NULL first to prevent race */
+    struct wl_callback *cb = out->frame_callback;
+    out->frame_callback = NULL;
+    if (cb) {
+        wl_callback_destroy(cb);
     }
 
     /* Transition to pending destroy state */
@@ -140,12 +144,26 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
     (void)time;
     Output *out = data;
 
-    wl_callback_destroy(cb);
-    out->frame_callback = NULL;
+    /*
+     * Check if this callback is still the active one. layer_closed() may have
+     * already destroyed and NULLed out->frame_callback, in which case this
+     * callback is orphaned and we should just destroy it without side effects.
+     */
+    if (out->frame_callback == cb) {
+        out->frame_callback = NULL;
+        wl_callback_destroy(cb);
 
-    /* Only transition if we were actually waiting */
-    if (out->state == OUT_WAITING_CALLBACK) {
-        out->state = OUT_READY;
+        /* Only transition if we were actually waiting */
+        if (out->state == OUT_WAITING_CALLBACK) {
+            out->state = OUT_READY;
+        }
+    } else {
+        /*
+         * Orphaned callback - layer_closed already handled cleanup.
+         * The callback object was already destroyed in layer_closed,
+         * so we must NOT destroy it again here.
+         */
+        LOG_DEBUG("Output %s: orphaned frame callback (already cleaned up)", out->name);
     }
 }
 
@@ -156,8 +174,9 @@ static const struct wl_callback_listener frame_listener = {
 void wayland_request_frame(Output *out) {
     if (!out->surface) return;
 
-    /* Don't request frames in destruction states */
-    if (out->state == OUT_PENDING_DESTROY || out->state == OUT_PENDING_RECREATE) {
+    /* Don't request frames in destruction or defunct states */
+    if (out->state == OUT_PENDING_DESTROY || out->state == OUT_PENDING_RECREATE ||
+        out->state == OUT_DEFUNCT) {
         return;
     }
 
@@ -168,6 +187,10 @@ void wayland_request_frame(Output *out) {
     }
 
     out->frame_callback = wl_surface_frame(out->surface);
+    if (!out->frame_callback) {
+        LOG_WARN("Output %s: wl_surface_frame failed", out->name);
+        return;
+    }
     wl_callback_add_listener(out->frame_callback, &frame_listener, out);
     out->state = OUT_WAITING_CALLBACK;
 }

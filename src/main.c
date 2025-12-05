@@ -134,6 +134,45 @@ static bool any_output_ready(App *app) {
     return false;
 }
 
+/*
+ * Check if any output is actively rendering (ready or waiting for frame callback).
+ * This is used for the no-output timeout check - we consider WAITING_CALLBACK
+ * as "working" since it means we successfully rendered and are waiting for vsync.
+ */
+static bool any_output_active(App *app) {
+    Output *out;
+    wl_list_for_each(out, &app->outputs, link) {
+        if (out->state == OUT_READY || out->state == OUT_WAITING_CALLBACK)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Check if any output is in a potentially recoverable state.
+ * Returns false only if all outputs are defunct or the list is empty.
+ */
+static bool any_output_recoverable(App *app) {
+    if (wl_list_empty(&app->outputs)) return false;
+
+    Output *out;
+    wl_list_for_each(out, &app->outputs, link) {
+        if (out->state != OUT_DEFUNCT)
+            return true;
+    }
+    return false;
+}
+
+/*
+ * Calculate backoff delay for output recreation.
+ * Exponential backoff: 100ms, 200ms, 400ms, 800ms, 1.6s, 3.2s, max 5s
+ */
+static double get_recreation_backoff(int failures) {
+    if (failures <= 0) return 0.1;
+    double delay = 0.1 * (1 << (failures < 6 ? failures : 6));
+    return delay > 5.0 ? 5.0 : delay;
+}
+
 static GpuVendor vendor_from_node(const char *node) {
     if (!node) return GPU_VENDOR_UNKNOWN;
 
@@ -231,24 +270,31 @@ static bool reset_renderer(App *app) {
  *
  * This function handles the state machine transitions for outputs:
  * - OUT_PENDING_DESTROY → destroy Wayland resources → OUT_PENDING_RECREATE
- * - OUT_PENDING_RECREATE → create new surface → OUT_UNCONFIGURED
+ * - OUT_PENDING_RECREATE → create new surface → OUT_UNCONFIGURED (with backoff)
  *
  * Returns true if any surface was successfully recreated.
  */
-static bool process_output_lifecycle(App *app) {
+static bool process_output_lifecycle(App *app, double current_time) {
     bool any_recreated = false;
     Output *out;
 
+    /* Maximum recreation attempts before marking output as defunct */
+    const int max_failures = 10;
+
     wl_list_for_each(out, &app->outputs, link) {
+        /* Skip defunct outputs entirely */
+        if (out->state == OUT_DEFUNCT)
+            continue;
+
         /* Handle deferred destruction */
         if (out->state == OUT_PENDING_DESTROY) {
             LOG_DEBUG("Output %s: processing deferred destruction", out->name);
 
-            /* EGL resources already destroyed in layer_closed callback */
             /* Destroy Wayland resources - this transitions to OUT_PENDING_RECREATE */
             wayland_destroy_surface(out);
-
-            /* State is now OUT_PENDING_RECREATE */
+            /* Reset backoff on fresh destruction */
+            out->last_recreation_attempt = 0;
+            out->recreation_failures = 0;
         }
 
         /* Recreate surface if needed and output info is complete */
@@ -256,34 +302,68 @@ static bool process_output_lifecycle(App *app) {
             out->width > 0 && out->height > 0 && out->name[0] &&
             output_matches_filter(out, &app->config)) {
 
-            LOG_INFO("Output %s: recreating surface", out->name);
+            /* Apply exponential backoff */
+            double backoff = get_recreation_backoff(out->recreation_failures);
+            if (current_time - out->last_recreation_attempt < backoff) {
+                continue;  /* Not yet time to retry */
+            }
+
+            out->last_recreation_attempt = current_time;
+
+            /* Check if we've exceeded maximum attempts */
+            if (out->recreation_failures >= max_failures) {
+                LOG_ERROR("Output %s: exceeded %d recreation attempts, marking defunct",
+                          out->name, max_failures);
+                out->state = OUT_DEFUNCT;
+                continue;
+            }
+
+            LOG_INFO("Output %s: recreating surface (attempt %d)",
+                     out->name, out->recreation_failures + 1);
 
             if (wayland_create_surface(out, app) == 0) {
                 /*
                  * Wait for compositor to send configure event before creating
-                 * EGL surface. This is essential - without it, wl_egl_window_create
-                 * may fail or produce incorrect results.
+                 * EGL surface. Use dispatch_pending instead of roundtrip to
+                 * avoid blocking if compositor is slow or unresponsive.
                  */
+                if (wl_display_flush(app->display) < 0 && errno != EAGAIN) {
+                    LOG_WARN("Output %s: flush failed during recreation", out->name);
+                    wayland_destroy_surface(out);
+                    out->recreation_failures++;
+                    continue;
+                }
+
+                /* Give compositor a chance to send configure */
                 wl_display_roundtrip(app->display);
 
                 if (out->state == OUT_READY) {
                     if (app->renderer && renderer_create_output(app->renderer, out) == 0) {
                         LOG_INFO("Output %s: surface recreated successfully", out->name);
+                        out->recreation_failures = 0;
                         any_recreated = true;
                     } else {
                         LOG_ERROR("Output %s: failed to create EGL surface", out->name);
                         wayland_destroy_surface(out);
-                        /* Will retry on next iteration */
+                        out->recreation_failures++;
                     }
+                } else if (out->state == OUT_UNCONFIGURED) {
+                    /*
+                     * Surface created but not configured yet. This can happen if
+                     * compositor is slow. Leave it in UNCONFIGURED state - it will
+                     * transition to READY when configure event arrives.
+                     */
+                    LOG_DEBUG("Output %s: awaiting configure event", out->name);
+                    /* Don't count this as a failure - surface exists */
                 } else {
-                    LOG_WARN("Output %s: surface not configured after roundtrip (state=%s)",
+                    LOG_WARN("Output %s: unexpected state %s after creation",
                              out->name, output_state_name(out->state));
-                    /* Surface created but not configured yet - this is okay,
-                     * will be configured on next compositor event */
+                    wayland_destroy_surface(out);
+                    out->recreation_failures++;
                 }
             } else {
                 LOG_ERROR("Output %s: failed to create Wayland surface", out->name);
-                /* Will retry on next iteration */
+                out->recreation_failures++;
             }
         }
 
@@ -300,7 +380,7 @@ static bool process_output_lifecycle(App *app) {
                 LOG_WARN("Output %s: failed to reattach EGL surface, will recreate",
                          out->name);
                 wayland_destroy_surface(out);
-                /* State is now OUT_PENDING_RECREATE, will be handled on next iteration */
+                out->recreation_failures++;
             }
         }
     }
@@ -423,6 +503,8 @@ int main(int argc, char **argv) {
 
     /* Main loop */
     app.running = true;
+    app.last_output_ready_time = now();
+    app.no_output_iterations = 0;
 
     /*
      * DMA-BUF zero-copy path selection:
@@ -457,7 +539,12 @@ int main(int argc, char **argv) {
     const int max_skip = 5;
     const int reset_threshold = max_skip * 2;
 
+    /* Timeout for no-output condition (30 seconds) */
+    const double no_output_timeout = 30.0;
+
     while (app.running && !quit) {
+        double t = now();
+
         /* Reset renderer if requested (e.g., after compositor restart) */
         if (app.renderer_needs_reset) {
             if (have_frame && frame.type == FRAME_HW) {
@@ -471,7 +558,7 @@ int main(int argc, char **argv) {
         }
 
         /* Process deferred surface lifecycle operations */
-        bool surfaces_recreated = process_output_lifecycle(&app);
+        bool surfaces_recreated = process_output_lifecycle(&app, t);
 
         /*
          * After surface recreation, invalidate cached frame data.
@@ -493,18 +580,52 @@ int main(int argc, char **argv) {
              */
         }
 
+        /*
+         * Check for prolonged no-output condition.
+         * We use any_output_active() which includes WAITING_CALLBACK state,
+         * since that means we're actively rendering and waiting for vsync.
+         */
+        if (any_output_active(&app)) {
+            app.last_output_ready_time = t;
+            app.no_output_iterations = 0;
+        } else {
+            app.no_output_iterations++;
+
+            /* Check if all outputs are defunct (unrecoverable) */
+            if (!any_output_recoverable(&app)) {
+                LOG_ERROR("All outputs are defunct, exiting");
+                break;
+            }
+
+            /* Check for timeout */
+            if (t - app.last_output_ready_time > no_output_timeout) {
+                LOG_ERROR("No active outputs for %.0f seconds, exiting",
+                          no_output_timeout);
+                break;
+            }
+
+            /* Log periodic status during recovery */
+            if (app.no_output_iterations % 50 == 0) {  /* Every ~5 seconds */
+                LOG_WARN("Waiting for outputs to become ready (%.1fs elapsed)",
+                         t - app.last_output_ready_time);
+            }
+        }
+
         /* Prepare Wayland events */
         while (wl_display_prepare_read(app.display) != 0)
             wl_display_dispatch_pending(app.display);
 
         if (wl_display_flush(app.display) < 0 && errno != EAGAIN) {
             wl_display_cancel_read(app.display);
-            LOG_ERROR("Wayland display flush failed: %s", strerror(errno));
+            if (errno == EPIPE || errno == ECONNRESET) {
+                LOG_ERROR("Wayland connection lost: %s", strerror(errno));
+            } else {
+                LOG_ERROR("Wayland display flush failed: %s", strerror(errno));
+            }
             break;
         }
 
         /* Compute poll timeout */
-        double t = now();
         int timeout_ms;
 
         if (!app.clock_started) {
@@ -530,7 +651,12 @@ int main(int argc, char **argv) {
 
         if (ret > 0 && (pfd.revents & POLLIN)) {
             if (wl_display_read_events(app.display) < 0) {
-                LOG_ERROR("Wayland read events failed");
+                int err = wl_display_get_error(app.display);
+                if (err) {
+                    LOG_ERROR("Wayland read events failed (display error: %d)", err);
+                } else {
+                    LOG_ERROR("Wayland read events failed");
+                }
                 break;
             }
             wl_display_dispatch_pending(app.display);
@@ -538,8 +664,16 @@ int main(int argc, char **argv) {
             wl_display_cancel_read(app.display);
         }
 
-        if (wl_display_get_error(app.display)) {
-            LOG_ERROR("Wayland display error: %d", wl_display_get_error(app.display));
+        /* Check for protocol errors */
+        int wl_err = wl_display_get_error(app.display);
+        if (wl_err) {
+            LOG_ERROR("Wayland display error: %d", wl_err);
+            break;
+        }
+
+        /* Check for connection errors via POLLHUP/POLLERR */
+        if (ret > 0 && (pfd.revents & (POLLHUP | POLLERR))) {
+            LOG_ERROR("Wayland connection error (POLLHUP/POLLERR)");
             break;
         }
 
@@ -603,6 +737,8 @@ int main(int argc, char **argv) {
 
         /* Render to all ready outputs */
         if (have_frame) {
+            bool all_renders_failed = true;
+
             wl_list_for_each(out, &app.outputs, link) {
                 if (out->state != OUT_READY) continue;
 
@@ -623,6 +759,8 @@ int main(int argc, char **argv) {
                     continue;
                 }
 
+                all_renders_failed = false;
+
                 /* Detect render path on first frame */
                 if (!app.render_path_determined) {
                     app.render_path_determined = true;
@@ -638,6 +776,17 @@ int main(int argc, char **argv) {
 
                 out->frames_rendered++;
             }
+
+            /*
+             * If all renders failed (no output succeeded), close FDs now to prevent leak.
+             * Normally FDs are closed at start of next frame, but if no output rendered
+             * this frame, we must close them here.
+             */
+            if (all_renders_failed && have_frame && frame.type == FRAME_HW) {
+                decoder_close_dmabuf(&frame.hw.dmabuf);
+                have_frame = false;
+            }
+
             app.frame_counter++;
         }
     }

@@ -110,6 +110,8 @@ typedef struct {
  *         │                          [layer_closed]
  *         │                                    ▼
  *   [cleanup done]◄───────────── OUT_PENDING_DESTROY
+ *
+ *   OUT_DEFUNCT: Output permanently failed, will not be recreated
  */
 typedef enum {
     OUT_UNCONFIGURED,        /* Initial state, waiting for first configure */
@@ -117,6 +119,7 @@ typedef enum {
     OUT_WAITING_CALLBACK,    /* Waiting for frame callback */
     OUT_PENDING_DESTROY,     /* layer_closed received, waiting for cleanup */
     OUT_PENDING_RECREATE,    /* Cleanup done, waiting to recreate */
+    OUT_DEFUNCT,             /* Permanently failed, skip this output */
 } OutputState;
 
 typedef struct Output {
@@ -140,6 +143,10 @@ typedef struct Output {
 
     /* Track configured dimensions to detect actual changes */
     int configured_width, configured_height;
+
+    /* Recreation backoff state */
+    double last_recreation_attempt;
+    int recreation_failures;
 } Output;
 
 typedef struct Decoder Decoder;
@@ -179,6 +186,10 @@ typedef struct App {
 
     bool render_path_determined;
     bool use_dmabuf_path;
+
+    /* Compositor restart recovery state */
+    double last_output_ready_time;    /* When we last had a ready output */
+    int no_output_iterations;         /* Consecutive iterations with no ready outputs */
 } App;
 
 extern App *g_app;
